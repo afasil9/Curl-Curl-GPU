@@ -44,16 +44,15 @@ from ufl import (
     sin,
 )
 
-from utils import L2_norm, par_print
+from utils import JIT_OPTIONS, L2_norm, par_print
 
 PETSc.Log.begin()
 
 comm = MPI.COMM_WORLD
 degree = 2
-
 n = 16
 
-mesh = dolfinx.mesh.create_unit_cube(MPI.COMM_WORLD, n, n, n)
+mesh = dolfinx.mesh.create_unit_cube(comm, n, n, n)
 V = functionspace(mesh, ("N1curl", degree))
 tdim = mesh.topology.dim
 
@@ -78,17 +77,16 @@ bc = dolfinx.fem.dirichletbc(u_bc, dofs)
 u = TrialFunction(V)
 v = TestFunction(V)
 
-a = form(inner(curl(u), curl(v)) * dx + inner(u, v) * dx)
-L = form(inner(f, v) * dx)
+# a = form(inner(curl(u), curl(v)) * dx + inner(u, v) * dx)
+# L = form(inner(f, v) * dx)
+a = form(inner(curl(u), curl(v)) * dx + inner(u, v) * dx, jit_options=JIT_OPTIONS)
+L = form(inner(f, v) * dx, jit_options=JIT_OPTIONS)
 
-# Device matrix: assembled on host, mirrored to the GPU by PETSc
 t = dolfinx.common.Timer("Assemble matrix")
 A = assemble_matrix(a, bcs=[bc])
 A.assemble()
 del t
 
-
-par_print(comm, "assembling vector on CPU")
 # Device vectors
 t = dolfinx.common.Timer("Assemble vector")
 b = assemble_vector(L)
@@ -100,8 +98,6 @@ del t
 uh = Function(V)
 
 xv = A.createVecLeft()
-
-par_print(comm, "Setting up KSP")
 
 ksp = PETSc.KSP().create(mesh.comm)
 ksp.setOperators(A)
@@ -137,8 +133,6 @@ t = dolfinx.common.Timer("KSP setup")
 ksp.setUp()
 del t
 
-par_print(comm, "Setting up KSP done")
-
 t = dolfinx.common.Timer("Solve (CG + hypre on CPU)")
 ksp.solve(b, xv)
 del t
@@ -151,9 +145,9 @@ xv.copy(uh.x.petsc_vec)
 uh.x.scatter_forward()
 error = uh - u_ex
 
+dolfinx.common.list_timings(comm)
+PETSc.Log.view()
+
 par_print(comm, f"ksp reason: {ksp.getConvergedReason()}")
 par_print(comm, f"ksp iterations: {ksp.getIterationNumber()}")
 par_print(comm, f"L2 norm is {L2_norm(curl(error)):.8e}")
-
-dolfinx.common.list_timings(MPI.COMM_WORLD)
-PETSc.Log.view()
