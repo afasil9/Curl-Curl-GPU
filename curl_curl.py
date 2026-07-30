@@ -2,6 +2,10 @@
 """Curl-curl + mass solved on the GPU with PETSc + hypre.
 To run:
 PETSC_OPTIONS="-use_gpu_aware_mpi 0" python curl_curl.py 
+
+To run with GPU timings:
+PETSC_OPTIONS="-use_gpu_aware_mpi 0 -log_view_gpu_time" python curl_curl.py > output_gpu.txt 2>&1
+
 """
 
 
@@ -26,16 +30,16 @@ from dolfinx.fem import (
 from ufl import curl, inner, SpatialCoordinate, TrialFunction, TestFunction, dx, as_vector, sin, SpatialCoordinate, pi
 from dolfinx.fem.petsc import assemble_matrix, assemble_vector, apply_lifting, set_bc
 from dolfinx.mesh import exterior_facet_indices
-from utils import L2_norm, hypre_use_vendor_spgemm
+from utils import JIT_OPTIONS, L2_norm, hypre_use_vendor_spgemm
 from dolfinx.fem.petsc import discrete_gradient, interpolation_matrix
 
 PETSc.Log.begin()
 
+comm = MPI.COMM_WORLD
 degree = 2
+n = 16
 
-n = 8
-
-mesh = dolfinx.mesh.create_unit_cube(MPI.COMM_WORLD, n, n, n)
+mesh = dolfinx.mesh.create_unit_cube(comm, n, n, n)
 V = functionspace(mesh, ("N1curl", degree))
 tdim = mesh.topology.dim
 
@@ -60,8 +64,10 @@ bc = dolfinx.fem.dirichletbc(u_bc, dofs)
 u = TrialFunction(V)
 v = TestFunction(V)
 
-a = form(inner(curl(u), curl(v)) * dx + inner(u, v) * dx)
-L = form(inner(f, v) * dx)
+# a = form(inner(curl(u), curl(v)) * dx + inner(u, v) * dx)
+# L = form(inner(f, v) * dx)
+a = form(inner(curl(u), curl(v)) * dx + inner(u, v) * dx, jit_options=JIT_OPTIONS)
+L = form(inner(f, v) * dx, jit_options=JIT_OPTIONS)
 
 # Device matrix: assembled on host, mirrored to the GPU by PETSc
 t = dolfinx.common.Timer("Assemble matrix (aijcusparse)")
@@ -93,6 +99,8 @@ pc = ksp.getPC()
 pc.setType("hypre")
 pc.setHYPREType("ams")
 
+hypre_use_vendor_spgemm(0) # Use Hypres SPGemm. CuSparse runs into VRAM issues for large problems.
+
 # AMS auxiliary operators. dolfinx builds these as host AIJ. We need to convert them into aijcusparse
 V_CG = functionspace(mesh, ("CG", degree))
 G = discrete_gradient(V_CG, V)
@@ -106,11 +114,15 @@ Pi.assemble()
 Pi.convert(PETSc.Mat.Type.AIJCUSPARSE, Pi)
 pc.setHYPRESetInterpolations(tdim, ND_Pi_Full=Pi)
 
-PETSc.Options()["pc_hypre_ams_cycle_type"] = 1
+PETSc.Options()["pc_hypre_ams_cycle_type"] = 7
+PETSc.Options()["pc_hypre_ams_tol"] = 1e-8
+PETSc.Options()["pc_hypre_ams_max_iter"] = 1
+PETSc.Options()["pc_hypre_ams_amg_beta_theta"] = 0.25
+PETSc.Options()["pc_hypre_ams_print_level"] = 1
 
 opts = PETSc.Options()
 prefix = ksp.getOptionsPrefix() or ""
-opts[f"{prefix}ksp_monitor_true_residual"] = None
+# opts[f"{prefix}ksp_monitor_true_residual"] = None
 
 ksp.setFromOptions()
 
@@ -134,5 +146,5 @@ print(f"ksp reason: {ksp.getConvergedReason()}")
 print(f"ksp iterations: {ksp.getIterationNumber()}")
 print(f"L2 norm is {L2_norm(curl(error)):.8e}")
 
-# dolfinx.common.list_timings(MPI.COMM_WORLD)
-# PETSc.Log.view()
+dolfinx.common.list_timings(comm)
+PETSc.Log.view()
