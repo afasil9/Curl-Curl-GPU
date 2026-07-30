@@ -1,5 +1,15 @@
+
+"""Curl-curl + mass solved on the GPU with PETSc + hypre.
+To run:
+PETSC_OPTIONS="-use_gpu_aware_mpi 0" python curl_curl.py 
+"""
+
+
 from mpi4py import MPI
 from petsc4py import PETSc
+import petsc4py
+import sys
+petsc4py.init(sys.argv)
 
 import numpy as np
 import ufl
@@ -16,9 +26,12 @@ from dolfinx.fem import (
 from ufl import curl, inner, SpatialCoordinate, TrialFunction, TestFunction, dx, as_vector, sin, SpatialCoordinate, pi
 from dolfinx.fem.petsc import assemble_matrix, assemble_vector, apply_lifting, set_bc
 from dolfinx.mesh import exterior_facet_indices
-from utils import L2_norm
+from utils import L2_norm, hypre_use_vendor_spgemm
+from dolfinx.fem.petsc import discrete_gradient, interpolation_matrix
 
-degree = 1
+PETSc.Log.begin()
+
+degree = 2
 
 n = 8
 
@@ -60,7 +73,7 @@ del t
 b = A.createVecRight()
 b.setType(PETSc.Vec.Type.CUDA)
 b.set(0.0)
-uh = Function(V, )
+uh = Function(V)
 
 xv = A.createVecLeft()
 xv.setType(PETSc.Vec.Type.CUDA)
@@ -77,8 +90,28 @@ ksp.setOperators(A)
 ksp.setType(PETSc.KSP.Type.CG)
 ksp.setTolerances(rtol=1e-10, max_it=10000)
 pc = ksp.getPC()
-pc.setType(PETSc.PC.Type.HYPRE)
-pc.setHYPREType("boomeramg")
+pc.setType("hypre")
+pc.setHYPREType("ams")
+
+# AMS auxiliary operators. dolfinx builds these as host AIJ. We need to convert them into aijcusparse
+V_CG = functionspace(mesh, ("CG", degree))
+G = discrete_gradient(V_CG, V)
+G.assemble()
+G.convert(PETSc.Mat.Type.AIJCUSPARSE, G)
+pc.setHYPREDiscreteGradient(G)
+
+Vec_CG = functionspace(mesh, ("CG", degree, (tdim,)))
+Pi = interpolation_matrix(Vec_CG, V)
+Pi.assemble()
+Pi.convert(PETSc.Mat.Type.AIJCUSPARSE, Pi)
+pc.setHYPRESetInterpolations(tdim, ND_Pi_Full=Pi)
+
+PETSc.Options()["pc_hypre_ams_cycle_type"] = 1
+
+opts = PETSc.Options()
+prefix = ksp.getOptionsPrefix() or ""
+opts[f"{prefix}ksp_monitor_true_residual"] = None
+
 ksp.setFromOptions()
 
 t = dolfinx.common.Timer("KSP setup")
@@ -102,3 +135,4 @@ print(f"ksp iterations: {ksp.getIterationNumber()}")
 print(f"L2 norm is {L2_norm(curl(error)):.8e}")
 
 # dolfinx.common.list_timings(MPI.COMM_WORLD)
+# PETSc.Log.view()
