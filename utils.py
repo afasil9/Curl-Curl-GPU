@@ -20,8 +20,33 @@ def hypre_use_vendor_spgemm(use_vendor, libname="libHYPRE-3.1.0.so"):
     if not lib.HYPRE_Initialized():
         lib.HYPRE_Initialize()
     lib.HYPRE_SetSpGemmUseVendor(ctypes.c_int(int(use_vendor)))
- 
 
+JIT_OPTIONS = {
+    "cffi_extra_compile_args": [
+        "-O3",
+        "-march=native",
+        "-fno-math-errno",
+        "-fassociative-math",
+        "-fno-signed-zeros",
+        "-fno-trapping-math",
+        "-g0",
+    ],
+    "timeout": 60,
+}
+
+def run_header(comm, backend, degree, n, V):
+    """Print a machine-parsable description of the run at the top of the log."""
+    mesh = V.mesh
+    ndofs = V.dofmap.index_map.size_global * V.dofmap.index_map_bs
+    ncells = mesh.topology.index_map(mesh.topology.dim).size_global
+    par_print(comm, "=== run parameters ===")
+    par_print(comm, f"backend: {backend}")
+    par_print(comm, f"degree: {degree}")
+    par_print(comm, f"n: {n}")
+    par_print(comm, f"ncells: {ncells}")
+    par_print(comm, f"ndofs: {ndofs}")
+    par_print(comm, f"ranks: {comm.size}")
+    par_print(comm, "======================")
 
 def par_print(comm, string):
     if comm.rank == 0:
