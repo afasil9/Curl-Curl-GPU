@@ -4,7 +4,7 @@ curl(curl(u)) + u = f  on the unit cube,  u x n given on the boundary. Hiptmair 
 The error At the lowest level, AMS preconditioner is used. 
 The matricies for each order are assembled.
     
-To run:
+To run on GPU, use the following command:
     PETSC_OPTIONS="-use_gpu_aware_mpi 0" python p_multigrid.py
 """
 
@@ -40,7 +40,13 @@ from ufl import (
     sin,
     pi,
 )
-from dolfinx.fem.petsc import assemble_matrix, assemble_vector, apply_lifting, set_bc
+from dolfinx.fem.petsc import (
+    assemble_matrix,
+    assemble_vector,
+    apply_lifting,
+    create_vector,
+    set_bc,
+)
 from dolfinx.fem.petsc import discrete_gradient, interpolation_matrix
 from dolfinx.mesh import exterior_facet_indices
 from utils import L2_norm, hypre_use_vendor_spgemm, par_print, run_header, JIT_OPTIONS
@@ -79,7 +85,7 @@ class HiptmairJacobi:
 n = 8
 degree = 4
 degrees = list(range(1, degree + 1))  # unit-step p-ladder: 1, 2, ..., degree
-mat_type = "aijcusparse"
+mat_type = "aijcusparse"  # "aijcusparse" for GPU or "aij" for CPU
 
 smoother = "hiptmair"  # "hiptmair" or "jacobi"
 smoother_its = 3
@@ -172,10 +178,13 @@ for i in range(1, nlevels):
 run_header(comm, "pmg", degree, n, V_fine)
 
 L = form(inner(f, TestFunction(V_fine)) * dx, jit_options=JIT_OPTIONS)
-b = A_fine.createVecRight()
+
 if mat_type == "aijcusparse":
+    b = A_fine.createVecRight()
     b.setType(PETSc.Vec.Type.CUDA)
-b.set(0.0)
+else:
+    b = create_vector(V_fine)
+    b.set(0.0)
 
 t = dolfinx.common.Timer("Assemble vector")
 assemble_vector(b, L)
