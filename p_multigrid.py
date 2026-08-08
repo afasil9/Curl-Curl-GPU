@@ -50,6 +50,7 @@ from dolfinx.fem.petsc import (
 from dolfinx.fem.petsc import discrete_gradient, interpolation_matrix
 from dolfinx.mesh import exterior_facet_indices
 from utils import L2_norm, hypre_use_vendor_spgemm, par_print, run_header, JIT_OPTIONS
+from dolfinx.io import VTXWriter
 
 PETSc.Log.begin()
 
@@ -82,10 +83,10 @@ class HiptmairJacobi:
         y.axpy(1.0, self._y_aux)  # add the gradient-space correction
 
 
-n = 8
+n = 16
 degree = 4
 degrees = list(range(1, degree + 1))  # unit-step p-ladder: 1, 2, ..., degree
-mat_type = "aijcusparse"  # "aijcusparse" for GPU or "aij" for CPU
+mat_type = "aij"  # "aijcusparse" for GPU or "aij" for CPU
 
 smoother = "hiptmair"  # "hiptmair" or "jacobi"
 smoother_its = 3
@@ -324,3 +325,17 @@ PETSc.Log.view()
 par_print(comm, f"ksp reason: {reason}")
 par_print(comm, f"ksp iterations: {ksp.getIterationNumber()}")
 par_print(comm, f"L2 norm is {L2_norm(curl(uh - u_ex)):.8e}")
+
+#Output the solution to bp file
+
+vector_vis = functionspace(
+mesh, ("Discontinuous Lagrange", degree, (mesh.geometry.dim,))
+)
+B = curl(uh)
+B_expr = Expression(B, vector_vis.element.interpolation_points)
+B_vis = Function(vector_vis)
+B_vis.interpolate(B_expr)
+
+with VTXWriter(mesh.comm, "B.bp", B_vis, "BP4") as B_file:
+    B_file.write(0.0)
+
