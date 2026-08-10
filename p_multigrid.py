@@ -1,6 +1,6 @@
 """
 Curl-curl + mass solved on the GPU with PETSc, p-multigrid preconditioned CG.
-curl(curl(u)) + u = f  on the unit cube,  u x n given on the boundary. Hiptmair jacobi preconditioner at the highest levels with a Chebyshev smoother, solving residual correction equation
+curl(alpha curl(u)) + beta u = f  on the unit cube,  u x n given on the boundary. Hiptmair jacobi preconditioner at the highest levels with a Chebyshev smoother, solving residual correction equation
 The error At the lowest level, AMS preconditioner is used. 
 The matricies for each order are assembled.
     
@@ -83,9 +83,8 @@ class HiptmairJacobi:
         y.axpy(1.0, self._y_aux)  # add the gradient-space correction
 
 
-n = 16
-degree = 4
-degrees = list(range(1, degree + 1))  # unit-step p-ladder: 1, 2, ..., degree
+n = 32
+degrees = [1, 2, 3]  # Degree ladder
 mat_type = "aij"  # "aijcusparse" for GPU or "aij" for CPU
 
 smoother = "hiptmair"  # "hiptmair" or "jacobi"
@@ -101,6 +100,14 @@ tdim = mesh.topology.dim
 mesh.topology.create_connectivity(tdim - 1, tdim)
 facets = exterior_facet_indices(mesh.topology)
 
+DGO_space = functionspace(mesh, ("DG", 0))
+alpha = Function(DGO_space)
+beta = Function(DGO_space)
+
+alpha.interpolate(lambda x: np.where(x[0] <= 0.5, 1.0, 1.0))
+beta.interpolate(lambda x: np.where(x[0] <= 0.5, 1.0, 1.0))
+
+
 x = SpatialCoordinate(mesh)
 u_ex = as_vector(
     (
@@ -109,7 +116,7 @@ u_ex = as_vector(
         sin(pi * x[0]) * sin(pi * x[1]),
     )
 )
-f = curl(curl(u_ex)) + u_ex
+f = curl(alpha * curl(u_ex)) + beta * u_ex
 
 Vs = []  # function spaces, coarse -> fine
 As = []  # operators, one per level
@@ -126,7 +133,10 @@ for d in degrees:
     bc = dirichletbc(u_bc, dofs)
 
     u, v = TrialFunction(V), TestFunction(V)
-    a = form(inner(curl(u), curl(v)) * dx + inner(u, v) * dx, jit_options=JIT_OPTIONS)
+    a = form(
+        inner(alpha * curl(u), curl(v)) * dx + inner(beta * u, v) * dx,
+        jit_options=JIT_OPTIONS,
+    )
 
     t = dolfinx.common.Timer(f"Assemble matrix degree {d}")
     A = assemble_matrix(a, bcs=[bc], kind=mat_type)
@@ -176,7 +186,7 @@ for i in range(1, nlevels):
         P.convert(mat_type, P)
     prolongations.append(P)
 
-run_header(comm, "pmg", degree, n, V_fine)
+run_header(comm, "pmg", degrees[-1], n, V_fine)
 
 L = form(inner(f, TestFunction(V_fine)) * dx, jit_options=JIT_OPTIONS)
 
@@ -287,7 +297,7 @@ if smoother == "hiptmair":
         p, q = TrialFunction(S), TestFunction(S)
         s_bc = dirichletbc(Constant(mesh, PETSc.ScalarType(0.0)), s_dofs, S)
         K = assemble_matrix(
-            form(inner(grad(p), grad(q)) * dx, jit_options=JIT_OPTIONS),
+            form(inner(beta * grad(p), grad(q)) * dx, jit_options=JIT_OPTIONS),
             bcs=[s_bc],
             kind=mat_type,
         )
@@ -324,12 +334,13 @@ PETSc.Log.view()
 
 par_print(comm, f"ksp reason: {reason}")
 par_print(comm, f"ksp iterations: {ksp.getIterationNumber()}")
-par_print(comm, f"L2 norm is {L2_norm(curl(uh - u_ex)):.8e}")
+par_print(comm, f"L2 error is {L2_norm(uh - u_ex):.8e}")
+par_print(comm, f"curl error in L2 is {L2_norm(curl(uh - u_ex)):.8e}")
 
 #Output the solution to bp file
 
 vector_vis = functionspace(
-mesh, ("Discontinuous Lagrange", degree, (mesh.geometry.dim,))
+mesh, ("Discontinuous Lagrange", degrees[-1], (mesh.geometry.dim,))
 )
 B = curl(uh)
 B_expr = Expression(B, vector_vis.element.interpolation_points)
