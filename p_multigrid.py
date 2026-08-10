@@ -52,51 +52,6 @@ from dolfinx.mesh import exterior_facet_indices
 from utils import L2_norm, hypre_use_vendor_spgemm, par_print, run_header, JIT_OPTIONS
 from dolfinx.io import VTXWriter
 
-PETSc.Log.begin()
-
-n = 32
-degrees = [1, 2, 3, 4]  # Degree ladder
-
-use_gpu = False
-
-if use_gpu:
-    mat_type = "aijcusparse"
-else:
-    mat_type = "aij"
-
-smoother = "hiptmair"  # "hiptmair" or "jacobi"
-smoother_its = 3
-rtol = 1e-10
-max_it = 1000
-monitor = False
-
-comm = MPI.COMM_WORLD
-mesh = dolfinx.mesh.create_unit_cube(comm, n, n, n)
-tdim = mesh.topology.dim
-mesh.topology.create_connectivity(tdim - 1, tdim)
-facets = exterior_facet_indices(mesh.topology)
-
-DGO_space = functionspace(mesh, ("DG", 0))
-alpha = Function(DGO_space)
-beta = Function(DGO_space)
-
-alpha.interpolate(lambda x: np.where(x[0] <= 0.5, 1.0, 1.0))
-beta.interpolate(lambda x: np.where(x[0] <= 0.5, 1.0, 1.0))
-
-
-x = SpatialCoordinate(mesh)
-u_ex = as_vector(
-    (
-        sin(pi * x[1]) * sin(pi * x[2]),
-        sin(pi * x[2]) * sin(pi * x[0]),
-        sin(pi * x[0]) * sin(pi * x[1]),
-    )
-)
-f = curl(alpha * curl(u_ex)) + beta * u_ex
-
-output = False
-
-
 class HiptmairJacobi:
     """Point Jacobi in the Nedelec space + point Jacobi in the gradient space.
     Jacobi preconditioner is simply just the inverse diagonal.
@@ -198,7 +153,7 @@ def build_hierarchy(mesh, degrees, alpha, beta, u_ex, facets, mat_type):
     return Vs, As, forms, bcs, bc_dofs, prolongations, masks
 
 
-def build_rhs(V_fine, f, a_fine, bc_fine, mat_type):
+def build_rhs(V_fine, A_fine, f, a_fine, bc_fine, mat_type):
     L = form(inner(f, TestFunction(V_fine)) * dx, jit_options=JIT_OPTIONS)
 
     if mat_type == "aijcusparse":
@@ -221,7 +176,27 @@ def build_rhs(V_fine, f, a_fine, bc_fine, mat_type):
     return b, xv
 
 
-def setup_pmg(mesh, nlevels, prolongations, mat_type, ksp_type, smoother, rtol, max_it, monitor):
+def setup_pmg(
+    mesh,
+    degrees,
+    Vs,
+    As,
+    prolongations,
+    masks,
+    facets,
+    beta,
+    mat_type,
+    ksp_type,
+    smoother,
+    smoother_its,
+    rtol,
+    max_it,
+    monitor,
+):
+    tdim = mesh.topology.dim
+    nlevels = len(degrees)
+    A_fine = As[-1]
+
     ksp = PETSc.KSP().create(mesh.comm)
     ksp.setOptionsPrefix("pmg_")
     ksp.setOperators(A_fine)
@@ -334,51 +309,111 @@ def setup_pmg(mesh, nlevels, prolongations, mat_type, ksp_type, smoother, rtol, 
     return ksp
 
 
-Vs, As, forms, bcs, bc_dofs, prolongations, masks = build_hierarchy(
-    mesh, degrees, alpha, beta, u_ex, facets, mat_type
-)
+def main():
+    PETSc.Log.begin()
 
-V_fine, A_fine, a_fine, bc_fine = Vs[-1], As[-1], forms[-1], bcs[-1]
+    n = 32
+    degrees = [1, 2, 3, 4]  # Degree ladder
 
-b, xv = build_rhs(V_fine, f, a_fine, bc_fine, mat_type)
+    use_gpu = False
 
-ksp = setup_pmg(mesh, len(degrees), prolongations, mat_type, PETSc.KSP.Type.CG, smoother, rtol, max_it, monitor)
+    if use_gpu:
+        mat_type = "aijcusparse"
+    else:
+        mat_type = "aij"
 
-run_header(comm, "pmg", degrees[-1], n, Vs[-1])
+    smoother = "hiptmair"  # "hiptmair" or "jacobi"
+    smoother_its = 3
+    rtol = 1e-10
+    max_it = 1000
+    monitor = False
+    output = False
 
-t = dolfinx.common.Timer("Solve (CG + p-multigrid on GPU)")
-ksp.solve(b, xv)
-del t
+    comm = MPI.COMM_WORLD
+    mesh = dolfinx.mesh.create_unit_cube(comm, n, n, n)
+    tdim = mesh.topology.dim
+    mesh.topology.create_connectivity(tdim - 1, tdim)
+    facets = exterior_facet_indices(mesh.topology)
 
-reason = ksp.getConvergedReason()
-if reason < 0:
-    raise RuntimeError(f"KSP failed to converge, reason {reason}")
+    DGO_space = functionspace(mesh, ("DG", 0))
+    alpha = Function(DGO_space)
+    beta = Function(DGO_space)
 
-uh = Function(V_fine)
-xv.copy(uh.x.petsc_vec)
-uh.x.scatter_forward()
+    alpha.interpolate(lambda x: np.where(x[0] <= 0.5, 1.0, 1.0))
+    beta.interpolate(lambda x: np.where(x[0] <= 0.5, 1.0, 1.0))
 
-
-dolfinx.common.list_timings(comm)
-PETSc.Log.view()
-
-par_print(comm, f"ksp reason: {reason}")
-par_print(comm, f"ksp iterations: {ksp.getIterationNumber()}")
-par_print(comm, f"L2 error is {L2_norm(uh - u_ex):.8e}")
-par_print(comm, f"curl error in L2 is {L2_norm(curl(uh - u_ex)):.8e}")
-
-#Output the solution to bp file
-
-
-if output == True:
-    vector_vis = functionspace(
-    mesh, ("Discontinuous Lagrange", degrees[-1], (mesh.geometry.dim,))
+    x = SpatialCoordinate(mesh)
+    u_ex = as_vector(
+        (
+            sin(pi * x[1]) * sin(pi * x[2]),
+            sin(pi * x[2]) * sin(pi * x[0]),
+            sin(pi * x[0]) * sin(pi * x[1]),
+        )
     )
-    B = curl(uh)
-    B_expr = Expression(B, vector_vis.element.interpolation_points)
-    B_vis = Function(vector_vis)
-    B_vis.interpolate(B_expr)
+    f = curl(alpha * curl(u_ex)) + beta * u_ex
 
-    with VTXWriter(mesh.comm, "B.bp", B_vis, "BP4") as B_file:
-        B_file.write(0.0)
+    Vs, As, forms, bcs, bc_dofs, prolongations, masks = build_hierarchy(
+        mesh, degrees, alpha, beta, u_ex, facets, mat_type
+    )
+
+    V_fine, A_fine, a_fine, bc_fine = Vs[-1], As[-1], forms[-1], bcs[-1]
+
+    b, xv = build_rhs(V_fine, A_fine, f, a_fine, bc_fine, mat_type)
+
+    ksp = setup_pmg(
+        mesh,
+        degrees,
+        Vs,
+        As,
+        prolongations,
+        masks,
+        facets,
+        beta,
+        mat_type,
+        PETSc.KSP.Type.CG,
+        smoother,
+        smoother_its,
+        rtol,
+        max_it,
+        monitor,
+    )
+
+    run_header(comm, "pmg", degrees[-1], n, Vs[-1])
+
+    t = dolfinx.common.Timer("Solve (CG + p-multigrid on GPU)")
+    ksp.solve(b, xv)
+    del t
+
+    reason = ksp.getConvergedReason()
+    if reason < 0:
+        raise RuntimeError(f"KSP failed to converge, reason {reason}")
+
+    uh = Function(V_fine)
+    xv.copy(uh.x.petsc_vec)
+    uh.x.scatter_forward()
+
+    dolfinx.common.list_timings(comm)
+    PETSc.Log.view()
+
+    par_print(comm, f"ksp reason: {reason}")
+    par_print(comm, f"ksp iterations: {ksp.getIterationNumber()}")
+    par_print(comm, f"L2 error is {L2_norm(uh - u_ex):.8e}")
+    par_print(comm, f"curl error in L2 is {L2_norm(curl(uh - u_ex)):.8e}")
+
+    # Output the solution to bp file
+    if output:
+        vector_vis = functionspace(
+            mesh, ("Discontinuous Lagrange", degrees[-1], (mesh.geometry.dim,))
+        )
+        B = curl(uh)
+        B_expr = Expression(B, vector_vis.element.interpolation_points)
+        B_vis = Function(vector_vis)
+        B_vis.interpolate(B_expr)
+
+        with VTXWriter(mesh.comm, "B.bp", B_vis, "BP4") as B_file:
+            B_file.write(0.0)
+
+
+if __name__ == "__main__":
+    main()
 
