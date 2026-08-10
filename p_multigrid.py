@@ -54,6 +54,48 @@ from dolfinx.io import VTXWriter
 
 PETSc.Log.begin()
 
+n = 32
+degrees = [1, 2, 3, 4]  # Degree ladder
+
+use_gpu = False
+
+if use_gpu:
+    mat_type = "aijcusparse"
+else:
+    mat_type = "aij"
+
+smoother = "hiptmair"  # "hiptmair" or "jacobi"
+smoother_its = 3
+rtol = 1e-10
+max_it = 1000
+monitor = False
+
+comm = MPI.COMM_WORLD
+mesh = dolfinx.mesh.create_unit_cube(comm, n, n, n)
+tdim = mesh.topology.dim
+mesh.topology.create_connectivity(tdim - 1, tdim)
+facets = exterior_facet_indices(mesh.topology)
+
+DGO_space = functionspace(mesh, ("DG", 0))
+alpha = Function(DGO_space)
+beta = Function(DGO_space)
+
+alpha.interpolate(lambda x: np.where(x[0] <= 0.5, 1.0, 1.0))
+beta.interpolate(lambda x: np.where(x[0] <= 0.5, 1.0, 1.0))
+
+
+x = SpatialCoordinate(mesh)
+u_ex = as_vector(
+    (
+        sin(pi * x[1]) * sin(pi * x[2]),
+        sin(pi * x[2]) * sin(pi * x[0]),
+        sin(pi * x[0]) * sin(pi * x[1]),
+    )
+)
+f = curl(alpha * curl(u_ex)) + beta * u_ex
+
+output = False
+
 
 class HiptmairJacobi:
     """Point Jacobi in the Nedelec space + point Jacobi in the gradient space.
@@ -83,238 +125,226 @@ class HiptmairJacobi:
         y.axpy(1.0, self._y_aux)  # add the gradient-space correction
 
 
-n = 32
-degrees = [1, 2, 3]  # Degree ladder
-mat_type = "aij"  # "aijcusparse" for GPU or "aij" for CPU
 
-smoother = "hiptmair"  # "hiptmair" or "jacobi"
-smoother_its = 3
-esteig = "0,0.1,0,1.1"
-rtol = 1e-10
-max_it = 1000
-monitor = False
+def build_hierarchy(mesh, degrees, alpha, beta, u_ex, facets, mat_type):
+    comm = mesh.comm
+    tdim = mesh.topology.dim
 
-comm = MPI.COMM_WORLD
-mesh = dolfinx.mesh.create_unit_cube(comm, n, n, n)
-tdim = mesh.topology.dim
-mesh.topology.create_connectivity(tdim - 1, tdim)
-facets = exterior_facet_indices(mesh.topology)
+    Vs = []  # function spaces, coarse -> fine
+    As = []  # operators, one per level
+    forms = []  # bilinear forms, one per level
+    bcs = []  # Dirichlet bc, one per level
+    bc_dofs = []  # constrained dof indices, one per level
 
-DGO_space = functionspace(mesh, ("DG", 0))
-alpha = Function(DGO_space)
-beta = Function(DGO_space)
+    for d in degrees:
+        V = functionspace(mesh, ("N1curl", d))
+        dofs = locate_dofs_topological(V, tdim - 1, facets)
 
-alpha.interpolate(lambda x: np.where(x[0] <= 0.5, 1.0, 1.0))
-beta.interpolate(lambda x: np.where(x[0] <= 0.5, 1.0, 1.0))
+        u_bc = Function(V)
+        u_bc.interpolate(Expression(u_ex, V.element.interpolation_points))
+        bc = dirichletbc(u_bc, dofs)
+
+        u, v = TrialFunction(V), TestFunction(V)
+        a = form(
+            inner(alpha * curl(u), curl(v)) * dx + inner(beta * u, v) * dx,
+            jit_options=JIT_OPTIONS,
+        )
+
+        t = dolfinx.common.Timer(f"Assemble matrix degree {d}")
+        A = assemble_matrix(a, bcs=[bc], kind=mat_type)
+        A.assemble()
+        del t
+
+        Vs.append(V)
+        As.append(A)
+        forms.append(a)
+        bcs.append(bc)
+        bc_dofs.append(dofs)
+
+        ndofs = V.dofmap.index_map.size_global * V.dofmap.index_map_bs
+        par_print(comm, f"level degree {d}: {ndofs} dofs")
+
+    nlevels = len(degrees)
+
+    masks = [] # masks for each level, where 1 = free dof, 0 = constrained dof
+    for V, dofs in zip(Vs, bc_dofs):
+        bs = V.dofmap.index_map_bs
+        n_owned = V.dofmap.index_map.size_local * bs
+        blocked = (dofs[:, None] * bs + np.arange(bs)).ravel()
+        mask = np.ones(n_owned, dtype=PETSc.ScalarType)
+        mask[blocked[blocked < n_owned]] = 0.0
+        masks.append(mask)
+
+    prolongations = []
+    for i in range(1, nlevels):
+        # y = P x  (x in coarse space, y in fine space)
+        P = interpolation_matrix(Vs[i - 1], Vs[i])
+        P.assemble()
+
+        # P is not constrained, so we need to zero out the rows and columns
+
+        left, right = P.createVecLeft(), P.createVecRight()
+        left.array[:] = masks[i]
+        right.array[:] = masks[i - 1]
+
+        # Build prolongation with zero rows/columns for constrained dofs
+        P.diagonalScale(L=left, R=right)
+
+        if mat_type != P.getType():
+            P.convert(mat_type, P)
+        prolongations.append(P)
 
 
-x = SpatialCoordinate(mesh)
-u_ex = as_vector(
-    (
-        sin(pi * x[1]) * sin(pi * x[2]),
-        sin(pi * x[2]) * sin(pi * x[0]),
-        sin(pi * x[0]) * sin(pi * x[1]),
-    )
-)
-f = curl(alpha * curl(u_ex)) + beta * u_ex
+    return Vs, As, forms, bcs, bc_dofs, prolongations, masks
 
-Vs = []  # function spaces, coarse -> fine
-As = []  # operators, one per level
-forms = []  # bilinear forms, one per level
-bcs = []  # Dirichlet bc, one per level
-bc_dofs = []  # constrained dof indices, one per level
 
-for d in degrees:
-    V = functionspace(mesh, ("N1curl", d))
-    dofs = locate_dofs_topological(V, tdim - 1, facets)
+def build_rhs(V_fine, f, a_fine, bc_fine, mat_type):
+    L = form(inner(f, TestFunction(V_fine)) * dx, jit_options=JIT_OPTIONS)
 
-    u_bc = Function(V)
-    u_bc.interpolate(Expression(u_ex, V.element.interpolation_points))
-    bc = dirichletbc(u_bc, dofs)
+    if mat_type == "aijcusparse":
+        b = A_fine.createVecRight()
+        b.setType(PETSc.Vec.Type.CUDA)
+    else:
+        b = create_vector(V_fine)
 
-    u, v = TrialFunction(V), TestFunction(V)
-    a = form(
-        inner(alpha * curl(u), curl(v)) * dx + inner(beta * u, v) * dx,
-        jit_options=JIT_OPTIONS,
-    )
-
-    t = dolfinx.common.Timer(f"Assemble matrix degree {d}")
-    A = assemble_matrix(a, bcs=[bc], kind=mat_type)
-    A.assemble()
+    t = dolfinx.common.Timer("Assemble rhs vector")
+    assemble_vector(b, L)
+    apply_lifting(b, [a_fine], bcs=[[bc_fine]])
+    b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+    set_bc(b, [bc_fine])
     del t
 
-    Vs.append(V)
-    As.append(A)
-    forms.append(a)
-    bcs.append(bc)
-    bc_dofs.append(dofs)
+    xv = A_fine.createVecLeft()
+    if mat_type == "aijcusparse":
+        xv.setType(PETSc.Vec.Type.CUDA)
 
-    ndofs = V.dofmap.index_map.size_global * V.dofmap.index_map_bs
-    par_print(comm, f"level degree {d}: {ndofs} dofs")
+    return b, xv
 
-nlevels = len(degrees)
-V_fine = Vs[-1]
-A_fine = As[-1]
-a_fine = forms[-1]
-bc_fine = bcs[-1]
 
-masks = [] # masks for each level, where 1 = free dof, 0 = constrained dof
-for V, dofs in zip(Vs, bc_dofs):
-    bs = V.dofmap.index_map_bs
-    n_owned = V.dofmap.index_map.size_local * bs
-    blocked = (dofs[:, None] * bs + np.arange(bs)).ravel()
-    mask = np.ones(n_owned, dtype=PETSc.ScalarType)
-    mask[blocked[blocked < n_owned]] = 0.0
-    masks.append(mask)
+def setup_pmg(mesh, nlevels, prolongations, mat_type, ksp_type, smoother, rtol, max_it, monitor):
+    ksp = PETSc.KSP().create(mesh.comm)
+    ksp.setOptionsPrefix("pmg_")
+    ksp.setOperators(A_fine)
+    ksp.setType(ksp_type)
+    ksp.setTolerances(rtol=rtol, max_it=max_it)
+    ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
 
-prolongations = []
-for i in range(1, nlevels):
-    # y = P x  (x in coarse space, y in fine space)
-    P = interpolation_matrix(Vs[i - 1], Vs[i])
-    P.assemble()
+    pc = ksp.getPC()
+    pc.setType("mg")
+    pc.setMGLevels(nlevels)
+    pc.setMGType(PETSc.PC.MGType.MULTIPLICATIVE)
+    pc.setMGCycleType(PETSc.PC.MGCycleType.V)
 
-    # P is not constrained, so we need to zero out the rows and columns
+    for i, P in enumerate(prolongations, start=1):
+        pc.setMGInterpolation(i, P)
 
-    left, right = P.createVecLeft(), P.createVecRight()
-    left.array[:] = masks[i]
-    right.array[:] = masks[i - 1]
+    for i in range(nlevels):
+        pc.getMGSmoother(i).setOperators(As[i])
 
-    # Build prolongation with zero rows/columns for constrained dofs
-    P.diagonalScale(L=left, R=right)
+    esteig = "0,0.1,0,1.1"
 
-    if mat_type != P.getType():
-        P.convert(mat_type, P)
-    prolongations.append(P)
+    # Chebyshev smoothers on every level but the coarsest
+    opts = PETSc.Options()
+    opts.prefixPush(ksp.getOptionsPrefix())
+    opts["mg_levels_ksp_type"] = "chebyshev"
+    opts["mg_levels_ksp_max_it"] = smoother_its
+    opts["mg_levels_ksp_chebyshev_esteig"] = esteig
+    opts["mg_levels_esteig_ksp_type"] = "gmres"
+    opts["mg_levels_esteig_ksp_max_it"] = 20
+    if smoother == "jacobi" and nlevels > 1:
+        opts["mg_levels_pc_type"] = "jacobi"
+    if monitor:
+        opts["ksp_monitor_true_residual"] = None
+    opts.prefixPop()
 
-run_header(comm, "pmg", degrees[-1], n, V_fine)
+    coarse_ksp = pc.getMGCoarseSolve()
+    coarse_ksp.setType(PETSc.KSP.Type.PREONLY)
+    coarse_pc = coarse_ksp.getPC()
+    coarse_pc.setType("hypre")
+    coarse_pc.setHYPREType("ams")
 
-L = form(inner(f, TestFunction(V_fine)) * dx, jit_options=JIT_OPTIONS)
+    if mat_type == "aijcusparse":
+        hypre_use_vendor_spgemm(0)
 
-if mat_type == "aijcusparse":
-    b = A_fine.createVecRight()
-    b.setType(PETSc.Vec.Type.CUDA)
-else:
-    b = create_vector(V_fine)
-    b.set(0.0)
+    V_CG_coarse = functionspace(mesh, ("CG", degrees[0]))
+    G_ams = discrete_gradient(V_CG_coarse, Vs[0])
+    G_ams.assemble()
+    if mat_type != G_ams.getType():
+        G_ams.convert(mat_type, G_ams)
+    coarse_pc.setHYPREDiscreteGradient(G_ams)
 
-t = dolfinx.common.Timer("Assemble vector")
-assemble_vector(b, L)
-apply_lifting(b, [a_fine], bcs=[[bc_fine]])
-b.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
-set_bc(b, [bc_fine])
-del t
+    Vec_CG_coarse = functionspace(mesh, ("CG", degrees[0], (tdim,)))
+    Pi_ams = interpolation_matrix(Vec_CG_coarse, Vs[0])
+    Pi_ams.assemble()
+    if mat_type != Pi_ams.getType():
+        Pi_ams.convert(mat_type, Pi_ams)
+    coarse_pc.setHYPRESetInterpolations(tdim, ND_Pi_Full=Pi_ams)
 
-xv = A_fine.createVecLeft()
-if mat_type == "aijcusparse":
-    xv.setType(PETSc.Vec.Type.CUDA)
+    opts[f"{coarse_ksp.getOptionsPrefix()}pc_hypre_ams_cycle_type"] = 1
 
-ksp = PETSc.KSP().create(comm)
-ksp.setOptionsPrefix("pmg_")
-ksp.setOperators(A_fine)
-ksp.setType(PETSc.KSP.Type.CG)
-ksp.setTolerances(rtol=rtol, max_it=max_it)
-ksp.setNormType(PETSc.KSP.NormType.UNPRECONDITIONED)
+    ksp.setFromOptions()
 
-pc = ksp.getPC()
-pc.setType("mg")
-pc.setMGLevels(nlevels)
-pc.setMGType(PETSc.PC.MGType.MULTIPLICATIVE)
-pc.setMGCycleType(PETSc.PC.MGCycleType.V)
+    smoother_refs = []
+    if smoother == "hiptmair":
+        for i in range(1, nlevels):
+            d = degrees[i]
+            V = Vs[i]
 
-for i, P in enumerate(prolongations, start=1):
-    pc.setMGInterpolation(i, P)
+            S = functionspace(mesh, ("CG", d))
+            s_dofs = locate_dofs_topological(S, tdim - 1, facets)
 
-for i in range(nlevels):
-    pc.getMGSmoother(i).setOperators(As[i])
+            bs = S.dofmap.index_map_bs
+            n_owned = S.dofmap.index_map.size_local * bs
+            blocked = (s_dofs[:, None] * bs + np.arange(bs)).ravel()
+            s_mask = np.ones(n_owned, dtype=PETSc.ScalarType)
+            s_mask[blocked[blocked < n_owned]] = 0.0
 
-# Chebyshev smoothers on every level but the coarsest
-opts = PETSc.Options()
-opts.prefixPush(ksp.getOptionsPrefix())
-opts["mg_levels_ksp_type"] = "chebyshev"
-opts["mg_levels_ksp_max_it"] = smoother_its
-opts["mg_levels_ksp_chebyshev_esteig"] = esteig
-opts["mg_levels_esteig_ksp_type"] = "gmres"
-opts["mg_levels_esteig_ksp_max_it"] = 20
-if smoother == "jacobi" and nlevels > 1:
-    opts["mg_levels_pc_type"] = "jacobi"
-if monitor:
-    opts["ksp_monitor_true_residual"] = None
-opts.prefixPop()
+            G = discrete_gradient(S, V)
+            G.assemble()
+            left, right = G.createVecLeft(), G.createVecRight()
+            left.array[:] = masks[i]
+            right.array[:] = s_mask
+            G.diagonalScale(L=left, R=right)
+            if mat_type != G.getType():
+                G.convert(mat_type, G)
 
-coarse_ksp = pc.getMGCoarseSolve()
-coarse_ksp.setType(PETSc.KSP.Type.PREONLY)
-coarse_pc = coarse_ksp.getPC()
-coarse_pc.setType("hypre")
-coarse_pc.setHYPREType("ams")
+            # Diagonal of the CG stiffness matrix -> Jacobi in the gradient space
+            p, q = TrialFunction(S), TestFunction(S)
+            s_bc = dirichletbc(Constant(mesh, PETSc.ScalarType(0.0)), s_dofs, S)
+            K = assemble_matrix(
+                form(inner(beta * grad(p), grad(q)) * dx, jit_options=JIT_OPTIONS),
+                bcs=[s_bc],
+                kind=mat_type,
+            )
+            K.assemble()
+            aux_dinv = K.createVecRight()
+            K.getDiagonal(aux_dinv)
+            aux_dinv.reciprocal()
+            K.destroy()
 
-if mat_type == "aijcusparse":
-    hypre_use_vendor_spgemm(0)
+            level_pc = pc.getMGSmoother(i).getPC()
+            level_pc.setType(PETSc.PC.Type.PYTHON)
+            level_pc.setPythonContext(HiptmairJacobi(G, aux_dinv))
+            smoother_refs.append((G, aux_dinv))
 
-V_CG_coarse = functionspace(mesh, ("CG", degrees[0]))
-G_ams = discrete_gradient(V_CG_coarse, Vs[0])
-G_ams.assemble()
-if mat_type != G_ams.getType():
-    G_ams.convert(mat_type, G_ams)
-coarse_pc.setHYPREDiscreteGradient(G_ams)
+    t = dolfinx.common.Timer("KSP setup")
+    ksp.setUp()
+    del t
 
-Vec_CG_coarse = functionspace(mesh, ("CG", degrees[0], (tdim,)))
-Pi_ams = interpolation_matrix(Vec_CG_coarse, Vs[0])
-Pi_ams.assemble()
-if mat_type != Pi_ams.getType():
-    Pi_ams.convert(mat_type, Pi_ams)
-coarse_pc.setHYPRESetInterpolations(tdim, ND_Pi_Full=Pi_ams)
+    return ksp
 
-opts[f"{coarse_ksp.getOptionsPrefix()}pc_hypre_ams_cycle_type"] = 1
 
-ksp.setFromOptions()
+Vs, As, forms, bcs, bc_dofs, prolongations, masks = build_hierarchy(
+    mesh, degrees, alpha, beta, u_ex, facets, mat_type
+)
 
-smoother_refs = []
+V_fine, A_fine, a_fine, bc_fine = Vs[-1], As[-1], forms[-1], bcs[-1]
 
-if smoother == "hiptmair":
-    for i in range(1, nlevels):
-        d = degrees[i]
-        V = Vs[i]
+b, xv = build_rhs(V_fine, f, a_fine, bc_fine, mat_type)
 
-        S = functionspace(mesh, ("CG", d))
-        s_dofs = locate_dofs_topological(S, tdim - 1, facets)
+ksp = setup_pmg(mesh, len(degrees), prolongations, mat_type, PETSc.KSP.Type.CG, smoother, rtol, max_it, monitor)
 
-        bs = S.dofmap.index_map_bs
-        n_owned = S.dofmap.index_map.size_local * bs
-        blocked = (s_dofs[:, None] * bs + np.arange(bs)).ravel()
-        s_mask = np.ones(n_owned, dtype=PETSc.ScalarType)
-        s_mask[blocked[blocked < n_owned]] = 0.0
-
-        G = discrete_gradient(S, V)
-        G.assemble()
-        left, right = G.createVecLeft(), G.createVecRight()
-        left.array[:] = masks[i]
-        right.array[:] = s_mask
-        G.diagonalScale(L=left, R=right)
-        if mat_type != G.getType():
-            G.convert(mat_type, G)
-
-        # Diagonal of the CG stiffness matrix -> Jacobi in the gradient space
-        p, q = TrialFunction(S), TestFunction(S)
-        s_bc = dirichletbc(Constant(mesh, PETSc.ScalarType(0.0)), s_dofs, S)
-        K = assemble_matrix(
-            form(inner(beta * grad(p), grad(q)) * dx, jit_options=JIT_OPTIONS),
-            bcs=[s_bc],
-            kind=mat_type,
-        )
-        K.assemble()
-        aux_dinv = K.createVecRight()
-        K.getDiagonal(aux_dinv)
-        aux_dinv.reciprocal()
-        K.destroy()
-
-        level_pc = pc.getMGSmoother(i).getPC()
-        level_pc.setType(PETSc.PC.Type.PYTHON)
-        level_pc.setPythonContext(HiptmairJacobi(G, aux_dinv))
-        smoother_refs.append((G, aux_dinv))
-
-t = dolfinx.common.Timer("KSP setup")
-ksp.setUp()
-del t
+run_header(comm, "pmg", degrees[-1], n, Vs[-1])
 
 t = dolfinx.common.Timer("Solve (CG + p-multigrid on GPU)")
 ksp.solve(b, xv)
@@ -339,14 +369,16 @@ par_print(comm, f"curl error in L2 is {L2_norm(curl(uh - u_ex)):.8e}")
 
 #Output the solution to bp file
 
-vector_vis = functionspace(
-mesh, ("Discontinuous Lagrange", degrees[-1], (mesh.geometry.dim,))
-)
-B = curl(uh)
-B_expr = Expression(B, vector_vis.element.interpolation_points)
-B_vis = Function(vector_vis)
-B_vis.interpolate(B_expr)
 
-with VTXWriter(mesh.comm, "B.bp", B_vis, "BP4") as B_file:
-    B_file.write(0.0)
+if output == True:
+    vector_vis = functionspace(
+    mesh, ("Discontinuous Lagrange", degrees[-1], (mesh.geometry.dim,))
+    )
+    B = curl(uh)
+    B_expr = Expression(B, vector_vis.element.interpolation_points)
+    B_vis = Function(vector_vis)
+    B_vis.interpolate(B_expr)
+
+    with VTXWriter(mesh.comm, "B.bp", B_vis, "BP4") as B_file:
+        B_file.write(0.0)
 
