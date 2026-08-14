@@ -22,7 +22,6 @@ import dolfinx
 from dolfinx.fem import (
     Expression,
     Function,
-    assemble_scalar,
     form,
     functionspace,
     locate_dofs_topological,
@@ -75,11 +74,19 @@ A = assemble_matrix(a, bcs=[bc], kind="aijcusparse")
 A.assemble()
 del t
 
-# Device vectors
+t = dolfinx.common.Timer("Assemble vector")
+b_host = assemble_vector(L)
+apply_lifting(b_host, [a], bcs=[[bc]])
+b_host.ghostUpdate(addv=PETSc.InsertMode.ADD, mode=PETSc.ScatterMode.REVERSE)
+set_bc(b_host, [bc])
+del t
+
 b = A.createVecRight()
 b.setType(PETSc.Vec.Type.CUDA)
-b.set(0.0)
-uh = Function(V)
+b.setArray(b_host.getArray(readonly=True))
+
+xv = A.createVecLeft()
+xv.set(0.0)
 
 xv = A.createVecLeft()
 xv.setType(PETSc.Vec.Type.CUDA)
@@ -137,6 +144,8 @@ del t
 reason = ksp.getConvergedReason()
 if reason < 0:
     raise RuntimeError(f"KSP failed to converge, reason {reason}")
+
+uh = Function(V)
 
 xv.copy(uh.x.petsc_vec)
 uh.x.scatter_forward()
