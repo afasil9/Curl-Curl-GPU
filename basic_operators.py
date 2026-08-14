@@ -6,6 +6,7 @@ from dolfinx import mesh, fem
 from mpi4py import MPI
 import ufl
 from dolfinx.fem import form, assemble_matrix
+from dolfinx.fem.petsc import interpolation_matrix
 
 def curlcurl_reference_matrix(element, quadrature_degree=2):
 
@@ -147,3 +148,76 @@ mine = matvec(x)
 print(f"dofs {ndofs}, cells {number_of_cells}, classes {len(uperms)}")
 print("relative error:", np.linalg.norm(mine - reference) / np.linalg.norm(reference))
 
+
+# Interpolation operator - Matrix Free
+
+e_low = basix.create_element(
+    ElementFamily.N1E, CellType.tetrahedron, 1, lagrange_variant=LagrangeVariant.legendre
+)
+e_high = basix.create_element(
+    ElementFamily.N1E, CellType.tetrahedron, 2, lagrange_variant=LagrangeVariant.legendre
+)
+
+ufl_element_low = basix.ufl.wrap_element(e_low)
+ufl_element_high = basix.ufl.wrap_element(e_high)
+
+V_low = fem.functionspace(cube_mesh, ufl_element_low)
+V_high = fem.functionspace(cube_mesh, ufl_element_high)
+
+ndofs_low = V_low.dofmap.index_map.size_local
+ndofs_high = V_high.dofmap.index_map.size_local
+
+interp_matrix = interpolation_matrix(V_low, V_high)
+interp_matrix.assemble()
+print(f"interpolation matrix size: {interp_matrix.getSize()}")
+
+#%%
+
+# Get global DoF indices for cell 0
+dofs_low_cell0 = V_low.dofmap.cell_dofs(0)
+dofs_high_cell0 = V_high.dofmap.cell_dofs(0)
+
+print(f"Cell 0 low-order global DoF indices: {dofs_low_cell0}")
+print(f"Cell 0 high-order global DoF indices: {dofs_high_cell0}")
+
+
+def fold_interpolation(V_src, V_dst, element_src, element_dst, uperms):
+    """
+        B_folded[p] = Td_p · B_ref · Ts_p. 
+    """
+
+    B_ref_cell = np.ascontiguousarray(basix.compute_interpolation_operator(element_src, element_dst))
+    Ts = dense_transform(V_src, "Tt", uperms) 
+    Td = dense_transform(V_dst, "Tt_inv", uperms)
+
+    return np.einsum("pdi,ij,pjs->pds", Td, B_ref_cell, Ts, optimize=True)
+
+B_folded = fold_interpolation(V_low, V_high, e_low, e_high, uperms)
+
+
+def interpolation_mat_free(x, V_low, V_high):
+    dofmap_low = V_low.dofmap.list
+    dofmap_high = V_high.dofmap.list
+    mult = np.bincount(dofmap_high.ravel(), minlength=ndofs_high)[:ndofs_high].astype(float)
+
+    y_cell = np.einsum("cij,cj->ci", B_folded[clas], x[dofmap_low], optimize=True)
+    y = np.bincount(dofmap_high.ravel(), weights=y_cell.ravel(), minlength=ndofs_high)
+    return y[:ndofs_high] / mult
+
+
+rng = np.random.default_rng(0)
+x = rng.standard_normal(ndofs_low)
+y_mf = interpolation_mat_free(x, V_low, V_high)
+
+x_petsc = interp_matrix.createVecRight()   # size = ndofs_low
+y_petsc = interp_matrix.createVecLeft()    # size = ndofs_high
+x_petsc.array_w[:] = x
+interp_matrix.mult(x_petsc, y_petsc)
+y_assembled = y_petsc.array_r.copy()
+
+# Compare
+error = np.linalg.norm(y_mf - y_assembled)
+relative_error = error / np.linalg.norm(y_assembled)
+
+print("||B_mf x - B x|| =", error)
+print("relative error   =", relative_error)
