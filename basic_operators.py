@@ -9,7 +9,8 @@ from dolfinx.fem import form, assemble_matrix
 
 def curlcurl_reference_matrix(element, quadrature_degree=2):
 
-    """Computes reference matrix over a reference tet"""
+    """Computes reference matrix over a reference tet
+    (12, ndofs, ndofs) where 12 is the number of coefficients for the Piola map. The first 6 are for the curl-curl part, the last 6 are for the mass part."""
     pts, wts = basix.make_quadrature(element.cell_type, quadrature_degree)
 
     tab = element.tabulate(1, pts) #Evaluate the element basis functions and their first derivatives at the quadrature points.
@@ -27,7 +28,9 @@ def curlcurl_reference_matrix(element, quadrature_degree=2):
     mass_matrix = np.einsum("q,qia,qjb->abij", wts, phi, phi)
     stiffness_matrix = np.einsum("q,qia,qjb->abij", wts, curl, curl)
 
+    # 3x3 Tensor is symmetric 
     SYM = [(0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2)]
+
     out = []
     for src in (mass_matrix, stiffness_matrix):
         for a, b in SYM:
@@ -80,10 +83,11 @@ def piola_map(mesh):
     detJ = np.abs(np.linalg.det(J))
     Jinv = np.linalg.inv(J)
 
-    G = np.einsum("cab,cdb->cad", Jinv, Jinv)
-    H = np.einsum("cba,cbd->cad", J, J)
+    G = np.einsum("cab,cdb->cad", Jinv, Jinv) # G = inv(J) times inv(J) transposed
+    H = np.einsum("cba,cbd->cad", J, J) # H = J transposed times J
 
     coef = np.empty((len(J), 12))
+    SYM = [(0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2)]
     for k, (a, b) in enumerate(SYM):
         coef[:, k]     = detJ * G[:, a, b]
         coef[:, k + 6] = H[:, a, b] / detJ
@@ -91,19 +95,18 @@ def piola_map(mesh):
 
 degree = 4
 quadrature_degree = 2 * degree + 2
+
 element = basix.create_element(
     ElementFamily.N1E,
     CellType.tetrahedron,
     degree,
     lagrange_variant=LagrangeVariant.legendre
 )
+ufl_element = basix.ufl.wrap_element(element)
 
-
-SYM = [(0, 0), (1, 1), (2, 2), (0, 1), (0, 2), (1, 2)]   # same order as your reference matrices
-
-n = 10
+n = 4
 cube_mesh = mesh.create_unit_cube(MPI.COMM_WORLD, n, n, n)
-V = fem.functionspace(cube_mesh, ("N1E", degree))
+V = fem.functionspace(cube_mesh, ufl_element)
 number_of_cells = cube_mesh.topology.index_map(3).size_local
 
 clas, uperms = permutation_classes(cube_mesh) # These are unique codes that rank the pattern. For tets there are max 4! ways to permute the verticies. Class 
@@ -113,9 +116,10 @@ T  = dense_transform(V, "T",  uperms)
 Tt = dense_transform(V, "Tt", uperms)
 
 cell_coef = piola_map(cube_mesh)
-folded = np.einsum("pai,kij,pjb->pkab", T, refs, Tt, optimize=True) # T R T^T
 
-# Folded will give the cell matrices for each permutation class. The actual cell matrices are then given by A_cell[c] = folded[clas[c]] * cell_coef[c]
+# Folded generates a list of possible transformation matricies for each cell. The actual cell matrices are then given by A_cell[c] = folded[clas[c]] * cell_coef[c].
+ 
+folded_ref = np.einsum("pai,kij,pjb->pkab", T, refs, Tt, optimize=True) # T R T^T
 
 dofmap = V.dofmap.list
 ndofs = V.dofmap.index_map.size_local
@@ -127,7 +131,7 @@ cube_mesh.geometry.dofmaps[0] = dofmap
 def matvec(x):
     """y = A x, without ever forming A (or even A_cell)."""
     x_local = x[dofmap]
-    y_local = np.einsum("ck,ckab,cb->ca", cell_coef, folded[clas], x_local)
+    y_local = np.einsum("ck,ckab,cb->ca", cell_coef, folded_ref[clas], x_local)
     return np.bincount(dofmap.ravel(), weights=y_local.ravel(), minlength=ndofs)
 
 
