@@ -4,7 +4,16 @@
     -div(grad u) =: f,   
 
 For Lagrange degree p the expected L2 rate is p+1 and the H1 rate is p.
+To run:
+
+PETSC_OPTIONS="-use_gpu_aware_mpi 0" python3 poisson.py [-log_view ...]
 """
+
+import sys
+
+import petsc4py
+
+petsc4py.init(sys.argv)
 
 import numpy as np
 import ufl
@@ -67,7 +76,7 @@ del t
 ksp = PETSc.KSP().create(mesh.comm)
 ksp.setOperators(A)
 ksp.setType(PETSc.KSP.Type.CG)
-# Tighter than the discretisation error we are trying to measure
+
 ksp.setTolerances(rtol=1e-12)
 pc = ksp.getPC()
 pc.setType(PETSc.PC.Type.HYPRE)
