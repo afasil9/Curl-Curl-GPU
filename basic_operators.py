@@ -1,12 +1,13 @@
 #%%
 import basix
 import numpy as np
+import scipy.sparse as sp
 from basix import CellType, ElementFamily, LagrangeVariant
 from dolfinx import mesh, fem
 from mpi4py import MPI
 import ufl
 from dolfinx.fem import form, assemble_matrix
-from dolfinx.fem.petsc import interpolation_matrix
+from dolfinx.fem.petsc import interpolation_matrix, discrete_gradient
 
 def curlcurl_reference_matrix(element, quadrature_degree=2):
 
@@ -15,7 +16,7 @@ def curlcurl_reference_matrix(element, quadrature_degree=2):
     pts, wts = basix.make_quadrature(element.cell_type, quadrature_degree)
 
     tab = element.tabulate(1, pts) #Evaluate the element basis functions and their first derivatives at the quadrature points.
-    phi = tab[0]
+    phi = tab[0] # Undifferentiated basis functions
     dx, dy, dz = tab[1], tab[2], tab[3]
     curl = np.stack(
         [
@@ -50,7 +51,8 @@ def permutation_classes(mesh):
 
 
 def dense_transform(V, which, uperms):
-    """A_cell = T · (reference matrix) · Tᵗ. Transformation Matrix is given via basix."""
+    """Function returns the transformation matrices for each cell.
+    A_cell = T · (reference matrix) · Tᵗ. Transformation Matrix is given via basix."""
 
     dof_dim = V.dofmap.list.shape[1] # Number of dofs per cell
     out = np.empty((len(uperms), dof_dim, dof_dim))
@@ -75,7 +77,7 @@ def dense_transform(V, which, uperms):
 def piola_map(mesh):
     """Compute the coefficients for each cell, which are used to transform the reference matrix to the actual cell matrix. Jacobian is constant as we are using affine tetrahedra.
     12 coefficients per cell: 6 for the curl-curl part, 6 for the mass part."""
-    v = mesh.geometry.x[mesh.geometry.dofmaps[0]]
+    v = mesh.geometry.x[mesh.geometry.dofmaps[0]] # Physical coords, shape is (n_cells, nodes per cell, dim)
     e0 = v[:, 1] - v[:, 0]
     e1 = v[:, 2] - v[:, 0]
     e2 = v[:, 3] - v[:, 0]
@@ -94,7 +96,7 @@ def piola_map(mesh):
         coef[:, k + 6] = H[:, a, b] / detJ
     return coef
 
-degree = 4
+degree = 1
 quadrature_degree = 2 * degree + 2
 
 element = basix.create_element(
@@ -126,8 +128,6 @@ dofmap = V.dofmap.list
 ndofs = V.dofmap.index_map.size_local
 dofs_per_cell = dofmap.shape[1]
 
-# This will give the cell ordering 
-cube_mesh.geometry.dofmaps[0] = dofmap  
 
 def matvec(x):
     """y = A x, without ever forming A (or even A_cell)."""
@@ -171,7 +171,6 @@ interp_matrix = interpolation_matrix(V_low, V_high)
 interp_matrix.assemble()
 print(f"interpolation matrix size: {interp_matrix.getSize()}")
 
-#%%
 
 # Get global DoF indices for cell 0
 dofs_low_cell0 = V_low.dofmap.cell_dofs(0)
@@ -221,3 +220,27 @@ relative_error = error / np.linalg.norm(y_assembled)
 
 print("||B_mf x - B x|| =", error)
 print("relative error   =", relative_error)
+
+#%%
+def discrete_gradient_reference_matrix(element_h1, element_curl):
+
+    pts = element_curl.points # Nédélec interpolation points
+    nq, tdim = pts.shape
+    tab = element_h1.tabulate(1, pts) 
+    dphi = tab[1:, :, :, 0].reshape(tdim * nq, -1)   # (tdim*nq, n0)
+    ref_mat = element_curl.interpolation_matrix @ dphi
+    return ref_mat
+
+# Test 
+
+element_h1 = basix.create_element(
+    ElementFamily.P, CellType.tetrahedron, degree,
+    lagrange_variant=LagrangeVariant.gll_warped
+)
+
+element_curl = basix.create_element(
+    ElementFamily.N1E, CellType.tetrahedron, degree,
+    lagrange_variant=LagrangeVariant.legendre
+)
+
+discrete_grad_ref = discrete_gradient_reference_matrix(element_h1, element_curl)
