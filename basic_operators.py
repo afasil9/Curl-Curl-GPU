@@ -97,7 +97,7 @@ def piola_map(mesh):
         coef[:, k + 6] = H[:, a, b] / detJ
     return coef
 
-degree = 4
+degree = 3
 quadrature_degree = 2 * degree + 2
 
 element = basix.create_element(
@@ -137,14 +137,14 @@ def matvec(x):
     return np.bincount(dofmap.ravel(), weights=y_local.ravel(), minlength=ndofs)
 
 
-# Check against the assembled operator. Keep n small: to_dense() is O(ndofs^2).
+# Check against the assembled operator.
 u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
 a = form((ufl.inner(ufl.curl(u), ufl.curl(v)) + ufl.inner(u, v)) * ufl.dx)
 A = assemble_matrix(a)
 A.scatter_reverse()
 
 x = np.random.default_rng(0).standard_normal(ndofs)
-reference = A.to_dense() @ x
+reference = A.to_scipy() @ x
 mine = matvec(x)
 print(f"dofs {ndofs}, cells {n_cells}, classes {len(uperms)}")
 print("relative error:", np.linalg.norm(mine - reference) / np.linalg.norm(reference))
@@ -316,3 +316,68 @@ G_petsc.mult(xp, yp)                   # yp = G x
 y_petsc = yp.array_r.copy()
 
 print("Error is ", norm(y - y_petsc))
+
+def boundary_dof_mask(V):
+    """Gives an array 0s and 1s"""
+    msh = V.mesh
+    tdim = msh.topology.dim
+    msh.topology.create_connectivity(tdim - 1, tdim)
+    facets = mesh.exterior_facet_indices(msh.topology)
+    bdofs = fem.locate_dofs_topological(V, tdim - 1, facets)
+
+    mask = np.zeros(V.dofmap.index_map.size_local + V.dofmap.index_map.num_ghosts)
+    #Identify all the dofs on the boundary
+    mask[bdofs] = 1
+    return mask
+
+
+bc_mask = boundary_dof_mask(V)[:ndofs]      # M:    1 on the boundary, 0 inside
+keep_mask = 1.0 - bc_mask                   # I - M: 0 on the boundary, 1 inside
+print(f"bc dofs: {int(bc_mask.sum())} of {ndofs}")
+
+
+def cell_matrix(c):
+    """ Cell wise matrix"""
+    k_mats = folded_ref[clas[c]]
+    A_cell = np.zeros((dofs_per_cell, dofs_per_cell))
+    for k in range(k_mats.shape[0]):
+        A_cell += cell_coef[c, k] * k_mats[k]
+    return A_cell
+
+#%%
+
+def matvec_bc(x):
+    """ y = ax with dirichlet Bcs"""
+    x_in = keep_mask * x      
+
+    y = np.zeros(ndofs)
+    for c in range(n_cells):
+        dofs = dofmap[c]
+        y[dofs] += cell_matrix(c) @ x_in[dofs] 
+
+    return keep_mask * y + bc_mask * x  
+
+
+def diagonal_bc():
+    d = np.zeros(ndofs)
+    for c in range(n_cells):
+        dofs = dofmap[c]
+        d[dofs] += np.diag(cell_matrix(c))
+
+    return keep_mask * d + bc_mask      # 1 on the bc diagonal
+
+
+g = fem.Function(V)
+bc = fem.dirichletbc(g, np.flatnonzero(boundary_dof_mask(V)))
+A_bc = assemble_matrix(a, bcs=[bc])
+A_bc.scatter_reverse()
+
+x = np.random.default_rng(0).standard_normal(ndofs)
+A_bc_sparse = A_bc.to_scipy()
+ref = A_bc_sparse @ x
+print("matvec_bc relative error:",
+      np.linalg.norm(matvec_bc(x) - ref) / np.linalg.norm(ref))
+
+ref_diag = A_bc_sparse.diagonal()
+print("diagonal_bc relative error:",
+      np.linalg.norm(diagonal_bc() - ref_diag) / np.linalg.norm(ref_diag))
