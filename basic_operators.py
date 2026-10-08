@@ -8,6 +8,7 @@ from mpi4py import MPI
 import ufl
 from dolfinx.fem import form, assemble_matrix
 from dolfinx.fem.petsc import interpolation_matrix, discrete_gradient
+from numpy.linalg import norm
 
 def curlcurl_reference_matrix(element, quadrature_degree=2):
 
@@ -96,7 +97,7 @@ def piola_map(mesh):
         coef[:, k + 6] = H[:, a, b] / detJ
     return coef
 
-degree = 1
+degree = 4
 quadrature_degree = 2 * degree + 2
 
 element = basix.create_element(
@@ -110,7 +111,7 @@ ufl_element = basix.ufl.wrap_element(element)
 n = 4
 cube_mesh = mesh.create_unit_cube(MPI.COMM_WORLD, n, n, n)
 V = fem.functionspace(cube_mesh, ufl_element)
-number_of_cells = cube_mesh.topology.index_map(3).size_local
+n_cells = cube_mesh.topology.index_map(3).size_local
 
 clas, uperms = permutation_classes(cube_mesh) # These are unique codes that rank the pattern. For tets there are max 4! ways to permute the verticies. Class 
 refs = curlcurl_reference_matrix(element, quadrature_degree)
@@ -145,7 +146,7 @@ A.scatter_reverse()
 x = np.random.default_rng(0).standard_normal(ndofs)
 reference = A.to_dense() @ x
 mine = matvec(x)
-print(f"dofs {ndofs}, cells {number_of_cells}, classes {len(uperms)}")
+print(f"dofs {ndofs}, cells {n_cells}, classes {len(uperms)}")
 print("relative error:", np.linalg.norm(mine - reference) / np.linalg.norm(reference))
 
 
@@ -221,7 +222,6 @@ relative_error = error / np.linalg.norm(y_assembled)
 print("||B_mf x - B x|| =", error)
 print("relative error   =", relative_error)
 
-#%%
 def discrete_gradient_reference_matrix(element_h1, element_curl):
 
     pts = element_curl.points # Nédélec interpolation points
@@ -244,3 +244,75 @@ element_curl = basix.create_element(
 )
 
 discrete_grad_ref = discrete_gradient_reference_matrix(element_h1, element_curl)
+
+
+
+def fold_discrete_gradient(V_lagrange, V_nedelec, element_lagrange, element_nedelec, uperms):
+    # Step 1: reference-cell matrix, shape (140, 56)
+    G_ref = discrete_gradient_reference_matrix(element_lagrange, element_nedelec)
+
+    # Step 2: transformation matrices, one per class
+    Ts = dense_transform(V_lagrange, "Tt", uperms)      # shape (n_classes, 56, 56)
+    Td = dense_transform(V_nedelec, "Tt_inv", uperms)   # shape (n_classes, 140, 140)
+
+    # Step 3: for each class, sandwich G_ref between its two transformations
+    n_classes = len(uperms)
+    G_folded = np.zeros((n_classes, G_ref.shape[0], G_ref.shape[1]))   # (n_classes, 140, 56)
+
+    for p in range(n_classes):
+        G_folded[p] = Td[p] @ G_ref @ Ts[p]    # (140,140) @ (140,56) @ (56,56) → (140,56)
+
+    return G_folded
+
+
+V_lag = fem.functionspace(cube_mesh, basix.ufl.wrap_element(element_h1))
+V_ned = fem.functionspace(cube_mesh, basix.ufl.wrap_element(element_curl))
+
+dofmap_lag = V_lag.dofmap.list
+dofmap_ned = V_ned.dofmap.list
+
+n_dofs_ned = V_ned.dofmap.index_map.size_local
+
+
+"""y = G x, one cell at a time."""
+dofmap_lag = V_lag.dofmap.list
+dofmap_ned = V_ned.dofmap.list
+n_dofs_ned = V_ned.dofmap.index_map.size_local
+
+im_lag = V_lag.dofmap.index_map
+im_ned = V_ned.dofmap.index_map
+n_lag_all = im_lag.size_local + im_lag.num_ghosts
+n_ned_all = im_ned.size_local + im_ned.num_ghosts
+
+x = np.random.default_rng(0).standard_normal(n_lag_all)   # an H1 vector, not the N1E one above
+y = np.zeros(n_ned_all)                   # output vector, one entry per Nédélec DOF
+G_folded = fold_discrete_gradient(V_lag, V_ned, element_h1, element_curl, uperms)
+
+for c in range(n_cells):
+    lag_dofs = dofmap_lag[c]
+    ned_dofs = dofmap_ned[c]
+
+    x_local = x[lag_dofs]
+
+    k = clas[c]
+    G_local = G_folded[k]
+
+    y_local = G_local @ x_local  
+
+    y[ned_dofs] = y_local
+
+G_petsc = discrete_gradient(V_lag, V_ned)
+G_petsc.assemble()
+
+
+# yp (ned) = G * xp(Lag)
+xp = G_petsc.createVecRight()
+yp = G_petsc.createVecLeft()
+
+n_lag = xp.getLocalSize()
+xp.array_w[:] = x[:n_lag]
+
+G_petsc.mult(xp, yp)                   # yp = G x
+y_petsc = yp.array_r.copy()
+
+print("Error is ", norm(y - y_petsc))
