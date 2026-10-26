@@ -344,7 +344,6 @@ def cell_matrix(c):
         A_cell += cell_coef[c, k] * k_mats[k]
     return A_cell
 
-#%%
 
 def matvec_bc(x):
     """ y = ax with dirichlet Bcs"""
@@ -381,3 +380,46 @@ print("matvec_bc relative error:",
 ref_diag = A_bc_sparse.diagonal()
 print("diagonal_bc relative error:",
       np.linalg.norm(diagonal_bc() - ref_diag) / np.linalg.norm(ref_diag))
+
+def apply_transfer(x, V_src, V_dst, B_folded, clas):
+    """Calculate y = B @ x without explicitly constructing B."""
+
+    dofmap_src = V_src.dofmap.list
+    dofmap_dst = V_dst.dofmap.list
+
+    # i = cell, j = dof per cell in V_dst, k = dof per cell in V_src
+    y_cell = np.einsum("ijk,ik->ij", B_folded[clas], x[dofmap_src], optimize=True)
+
+    nd = V_dst.dofmap.index_map.size_local
+    mult = np.bincount(dofmap_dst.ravel(), minlength=nd)[:nd].astype(float)
+    y = np.bincount(dofmap_dst.ravel(), weights=y_cell.ravel(), minlength=nd)
+    return y[:nd] / mult
+
+def apply_transfer_transpose(x, V_src, V_dst, B_folded, clas):
+    """y = B^T x, without ever forming B^T (or even B_cell^T)."""
+    dofmap_src = V_src.dofmap.list # (number of cells, dofs per cell)
+    dofmap_dst = V_dst.dofmap.list
+
+    # i = cell, j = dof per cell in V_dst, k = dof per cell in V_src
+    y_cell = np.einsum("ijk,ij->ik", B_folded[clas], x[dofmap_dst], optimize=True)
+
+    y = np.bincount(dofmap_src.ravel(), weights=y_cell.ravel(), minlength=V_src.dofmap.index_map.size_local)
+    return y[:V_src.dofmap.index_map.size_local]
+
+V_src = V_low
+V_dst = V_high
+x = np.random.default_rng(0).standard_normal(V_src.dofmap.index_map.size_local)
+
+y = apply_transfer(x, V_src, V_dst, B_folded, clas)
+
+P = interpolation_matrix(V_src, V_dst)
+P.assemble()
+xp, yp = P.createVecRight(), P.createVecLeft()
+xp.array_w[:] = x
+P.mult(xp, yp) # y = P x
+ref = yp.array_r.copy()
+
+y = apply_transfer(x, V_src, V_dst, B_folded, clas)
+print("apply_transfer relative error:", np.linalg.norm(y - ref) / np.linalg.norm(ref))
+
+
