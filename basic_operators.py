@@ -129,12 +129,30 @@ dofmap = V.dofmap.list
 ndofs = V.dofmap.index_map.size_local
 dofs_per_cell = dofmap.shape[1]
 
+n_classes = len(uperms) # note max 4! classes.
+
+# Group all the cells that share the class
+cells_in_class = [np.flatnonzero(clas == k) for k in range(n_classes)]
+#%%
 
 def matvec(x):
     """y = A x, without ever forming A (or even A_cell)."""
-    x_local = x[dofmap]
-    y_local = np.einsum("ck,ckab,cb->ca", cell_coef, folded_ref[clas], x_local)
-    return np.bincount(dofmap.ravel(), weights=y_local.ravel(), minlength=ndofs)
+    y = np.zeros(ndofs)
+
+    for k in range(n_classes):
+        cells = cells_in_class[k]      # The cells that share reference matrix k
+        dofs = dofmap[cells]               # (n_cells_in_group, nd)
+        x_local = x[dofs]
+
+        # Apply the 12 reference matrices to x first, giving one vector per
+        # coefficient, then weight those by each cell's Piola coefficients.
+
+        folded_x = np.einsum("kab,cb->cka", folded_ref[k], x_local)
+        y_local = np.einsum("ck,cka->ca", cell_coef[cells], folded_x)
+
+        y += np.bincount(dofs.ravel(), weights=y_local.ravel(), minlength=ndofs)
+
+    return y
 
 
 # Check against the assembled operator.
