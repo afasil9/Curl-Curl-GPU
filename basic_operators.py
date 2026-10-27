@@ -395,16 +395,28 @@ def apply_transfer(x, V_src, V_dst, B_folded, clas):
     y = np.bincount(dofmap_dst.ravel(), weights=y_cell.ravel(), minlength=nd)
     return y[:nd] / mult
 
+
 def apply_transfer_transpose(x, V_src, V_dst, B_folded, clas):
-    """y = B^T x, without ever forming B^T (or even B_cell^T)."""
+    """Transpose of apply transfer. Going from high order to low order. Restriction operator."""
+    
     dofmap_src = V_src.dofmap.list # (number of cells, dofs per cell)
     dofmap_dst = V_dst.dofmap.list
 
-    # i = cell, j = dof per cell in V_dst, k = dof per cell in V_src
-    y_cell = np.einsum("ijk,ij->ik", B_folded[clas], x[dofmap_dst], optimize=True)
+    n_src = V_src.dofmap.index_map.size_local
+    n_dst = V_dst.dofmap.index_map.size_local
 
-    y = np.bincount(dofmap_src.ravel(), weights=y_cell.ravel(), minlength=V_src.dofmap.index_map.size_local)
-    return y[:V_src.dofmap.index_map.size_local]
+    mult = np.bincount(dofmap_dst.ravel(), minlength=n_dst)[:n_dst].astype(float)
+    xs = x / mult
+
+    # bincount will tell us how many times each dof appears across all the cells. For shared dofs, we need to divide by the number of times they appear.
+
+    y_cell = np.einsum("ijk,ij->ik", B_folded[clas], xs[
+        dofmap_dst
+    ], optimize=True)
+
+    y = np.bincount(dofmap_src.ravel(), weights=y_cell.ravel(), minlength=n_src)[:n_src]
+
+    return y
 
 V_src = V_low
 V_dst = V_high
@@ -422,4 +434,17 @@ ref = yp.array_r.copy()
 y = apply_transfer(x, V_src, V_dst, B_folded, clas)
 print("apply_transfer relative error:", np.linalg.norm(y - ref) / np.linalg.norm(ref))
 
+# Test apply_transfer_transpose
+x = np.random.default_rng(0).standard_normal(V_dst.dofmap.index_map.size_local)
+y = apply_transfer_transpose(x, V_src, V_dst, B_folded, clas)
+P = interpolation_matrix(V_src, V_dst)
+P.assemble()
+xp, yp = P.createVecRight(), P.createVecLeft()
+yp.array_w[:] = x
+P.multTranspose(yp, xp) # y = P^T x
+ref = xp.array_r.copy()
+y = apply_transfer_transpose(x, V_src, V_dst, B_folded, clas)
+print("apply_transfer_transpose relative error:", np.linalg.norm(y - ref) / np.linalg.norm(ref))
 
+
+# %%
