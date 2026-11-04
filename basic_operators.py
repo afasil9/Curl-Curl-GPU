@@ -133,7 +133,6 @@ n_classes = len(uperms) # note max 4! classes.
 
 # Group all the cells that share the class
 cells_in_class = [np.flatnonzero(clas == k) for k in range(n_classes)]
-#%%
 
 def matvec(x):
     """y = A x, without ever forming A (or even A_cell)."""
@@ -465,4 +464,55 @@ y = apply_transfer_transpose(x, V_src, V_dst, B_folded, clas)
 print("apply_transfer_transpose relative error:", np.linalg.norm(y - ref) / np.linalg.norm(ref))
 
 
-# %%
+def get_diagonal():
+    d = np.zeros(ndofs)
+    for c in range(n_cells):
+        dofs = dofmap[c]
+        k_mats = folded_ref[clas[c]]         # Component matricies
+        A_cell = np.zeros((dofs_per_cell, dofs_per_cell))
+        for k in range(k_mats.shape[0]):
+            A_cell += cell_coef[c, k] * k_mats[k]
+        d[dofs] += np.diag(A_cell)
+    return d
+
+A_mat = assemble_matrix(a)
+A_mat.scatter_reverse()
+A_mat_sp = A_mat.to_scipy()
+print("A_mat_sp.diagonal():", A_mat_sp.diagonal())
+diag_assembled = A_mat_sp.diagonal()
+diag_computed = get_diagonal()
+
+print("Relative error:", np.linalg.norm(diag_computed - diag_assembled) / np.linalg.norm(diag_assembled))
+
+
+#%%
+class CurlCurlMatFree:
+    """Matrix free operator for curl-curl + mass. This is a linear operator that can be used with Krylov solvers."""
+
+    def __init__(self, V, folded_ref, cell_coef, clas, dofmap):
+        self.V = V
+        self.folded_ref = folded_ref
+        self.cell_coef = cell_coef
+        self.clas = clas
+        self.dofmap = dofmap
+        self.ndofs = V.dofmap.index_map.size_local
+        self.n_classes = len(folded_ref)
+
+        self.cells_in_class = [
+            np.flatnonzero(clas == k) for k in range(self.n_classes)
+        ]
+
+    def matvec(self, x):
+        y = np.zeros(self.ndofs)
+        for k in range(self.n_classes):
+            cells = self.cells_in_class[k]
+            dofs = self.dofmap[cells]
+            x_local = x[dofs]
+
+            folded_x = np.einsum("kab,cb->cka", self.folded_ref[k], x_local)
+            y_local = np.einsum("ck,cka->ca", self.cell_coef[cells], folded_x)
+
+            y += np.bincount(dofs.ravel(), weights=y_local.ravel(),
+                             minlength=self.ndofs)
+        return y
+
