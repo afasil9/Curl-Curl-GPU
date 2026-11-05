@@ -501,18 +501,33 @@ class CurlCurlMatFree:
         self.cells_in_class = [
             np.flatnonzero(clas == k) for k in range(self.n_classes)
         ]
+        self.dofs_in_class = [dofmap[cells] for cells in self.cells_in_class]
+        self.coef_in_class = [cell_coef[cells] for cells in self.cells_in_class]
+        self.diag_ref = np.einsum("pkaa->pka", folded_ref)
 
     def matvec(self, x):
+        """y = A x, without ever forming A (or even A_cell)."""
         y = np.zeros(self.ndofs)
         for k in range(self.n_classes):
-            cells = self.cells_in_class[k]
-            dofs = self.dofmap[cells]
+            dofs = self.dofs_in_class[k]
             x_local = x[dofs]
 
-            folded_x = np.einsum("kab,cb->cka", self.folded_ref[k], x_local)
-            y_local = np.einsum("ck,cka->ca", self.cell_coef[cells], folded_x)
+            folded_x = np.einsum("kab,cb->cka", self.folded_ref[k], x_local,
+                                 optimize=True)
+            y_local = np.einsum("ck,cka->ca", self.coef_in_class[k], folded_x,
+                                optimize=True)
 
             y += np.bincount(dofs.ravel(), weights=y_local.ravel(),
                              minlength=self.ndofs)
         return y
+
+    def diagonal(self):
+        d = np.zeros(self.ndofs)
+        for k in range(self.n_classes):
+            dofs = self.dofs_in_class[k]
+            d_local = np.einsum("ck,ka->ca", self.coef_in_class[k],
+                                self.diag_ref[k], optimize=True)
+            d += np.bincount(dofs.ravel(), weights=d_local.ravel(),
+                             minlength=self.ndofs)
+        return d
 
