@@ -485,54 +485,6 @@ diag_computed = get_diagonal()
 print("Relative error:", np.linalg.norm(diag_computed - diag_assembled) / np.linalg.norm(diag_assembled))
 
 
-# building level 1 of pmg:
-
-n = 8
-degree_ladder = [1, 2, 3]
-msh = mesh.create_unit_cube(MPI.COMM_WORLD, n, n, n)
-cell_coef = piola_map(msh)
-
-clas, uperms = permutation_classes(msh)
-
-p = 1
-# building levels
-e1 = basix.create_element(ElementFamily.N1E, CellType.tetrahedron, p,
-                          lagrange_variant=LagrangeVariant.legendre)
-
-V1 = fem.functionspace(msh, basix.ufl.wrap_element(e1))
-dofmap1 = V1.dofmap.list
-print("dofs per cell:", dofmap1.shape[1])                # 6, one per edge
-print("total dofs:", V1.dofmap.index_map.size_local)     # 4184, the number of edges
-
-refs1 = curlcurl_reference_matrix(e1, quadrature_degree=2 * p + 2)
-print("refs:", refs1.shape)      
-
-T1  = dense_transform(V1, "T",  uperms)
-Tt1 = dense_transform(V1, "Tt", uperms)
-print("T:", T1.shape)
-
-folded_ref1 = np.einsum("pai,kij,pjb->pkab", T1, refs1, Tt1, optimize=True)
-print("folded_ref:", folded_ref1.shape)                   
-
-A1 = CurlCurlMatFree(V1, folded_ref1, cell_coef, clas, dofmap1)
-inv_diag1 = 1.0 / A1.diagonal()
-
-
-import ufl
-from dolfinx.fem import form, assemble_matrix
-
-u, v = ufl.TrialFunction(V1), ufl.TestFunction(V1)
-a1 = form((ufl.inner(ufl.curl(u), ufl.curl(v)) + ufl.inner(u, v)) * ufl.dx)
-A1_ref = assemble_matrix(a1)
-A1_ref.scatter_reverse()
-A1_sp = A1_ref.to_scipy()
-
-def rel(a, b):
-    return np.linalg.norm(a - b) / np.linalg.norm(b)
-
-x = np.random.default_rng(0).standard_normal(A1.ndofs)
-print("matvec:  ", rel(A1.matvec(x), A1_sp @ x))              # ~1e-15
-print("diagonal:", rel(A1.diagonal(), A1_sp.diagonal()))      # ~1e-15
 
 
 #%%
@@ -581,3 +533,50 @@ class CurlCurlMatFree:
                              minlength=self.ndofs)
         return d
 
+
+
+# building level 1 of pmg:
+
+n = 8
+degree_ladder = [1, 2, 3]
+msh = mesh.create_unit_cube(MPI.COMM_WORLD, n, n, n)
+cell_coef = piola_map(msh)
+
+clas, uperms = permutation_classes(msh)
+
+p = 1
+# building levels
+e1 = basix.create_element(ElementFamily.N1E, CellType.tetrahedron, p,
+                          lagrange_variant=LagrangeVariant.legendre)
+
+V1 = fem.functionspace(msh, basix.ufl.wrap_element(e1))
+dofmap1 = V1.dofmap.list
+print("dofs per cell:", dofmap1.shape[1])                # 6, one per edge
+print("total dofs:", V1.dofmap.index_map.size_local)     # 4184, the number of edges
+
+refs1 = curlcurl_reference_matrix(e1, quadrature_degree=2 * p + 2)
+print("refs:", refs1.shape)      
+
+T1  = dense_transform(V1, "T",  uperms)
+Tt1 = dense_transform(V1, "Tt", uperms)
+print("T:", T1.shape)
+
+folded_ref1 = np.einsum("pai,kij,pjb->pkab", T1, refs1, Tt1, optimize=True)
+print("folded_ref:", folded_ref1.shape)                   
+
+A1 = CurlCurlMatFree(V1, folded_ref1, cell_coef, clas, dofmap1)
+inv_diag1 = 1.0 / A1.diagonal()
+
+
+u, v = ufl.TrialFunction(V1), ufl.TestFunction(V1)
+a1 = form((ufl.inner(ufl.curl(u), ufl.curl(v)) + ufl.inner(u, v)) * ufl.dx)
+A1_ref = assemble_matrix(a1)
+A1_ref.scatter_reverse()
+A1_sp = A1_ref.to_scipy()
+
+def rel(a, b):
+    return np.linalg.norm(a - b) / np.linalg.norm(b)
+
+x = np.random.default_rng(0).standard_normal(A1.ndofs)
+print("matvec:  ", rel(A1.matvec(x), A1_sp @ x))              # ~1e-15
+print("diagonal:", rel(A1.diagonal(), A1_sp.diagonal()))      # ~1e-15
