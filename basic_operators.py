@@ -97,42 +97,43 @@ def piola_map(mesh):
         coef[:, k + 6] = H[:, a, b] / detJ
     return coef
 
-degree = 3
-quadrature_degree = 2 * degree + 2
+if __name__ == "__main__":
+    degree = 3
+    quadrature_degree = 2 * degree + 2
 
-element = basix.create_element(
-    ElementFamily.N1E,
-    CellType.tetrahedron,
-    degree,
-    lagrange_variant=LagrangeVariant.legendre
-)
-ufl_element = basix.ufl.wrap_element(element)
+    element = basix.create_element(
+        ElementFamily.N1E,
+        CellType.tetrahedron,
+        degree,
+        lagrange_variant=LagrangeVariant.legendre
+    )
+    ufl_element = basix.ufl.wrap_element(element)
 
-n = 4
-cube_mesh = mesh.create_unit_cube(MPI.COMM_WORLD, n, n, n)
-V = fem.functionspace(cube_mesh, ufl_element)
-n_cells = cube_mesh.topology.index_map(3).size_local
+    n = 4
+    cube_mesh = mesh.create_unit_cube(MPI.COMM_WORLD, n, n, n)
+    V = fem.functionspace(cube_mesh, ufl_element)
+    n_cells = cube_mesh.topology.index_map(3).size_local
 
-clas, uperms = permutation_classes(cube_mesh) # These are unique codes that rank the pattern. For tets there are max 4! ways to permute the verticies. Class 
-refs = curlcurl_reference_matrix(element, quadrature_degree)
+    clas, uperms = permutation_classes(cube_mesh) # These are unique codes that rank the pattern. For tets there are max 4! ways to permute the verticies. Class 
+    refs = curlcurl_reference_matrix(element, quadrature_degree)
 
-T  = dense_transform(V, "T",  uperms)
-Tt = dense_transform(V, "Tt", uperms)
+    T  = dense_transform(V, "T",  uperms)
+    Tt = dense_transform(V, "Tt", uperms)
 
-cell_coef = piola_map(cube_mesh)
+    cell_coef = piola_map(cube_mesh)
 
-# Folded generates a list of possible transformation matricies for each cell. The actual cell matrices are then given by A_cell[c] = folded[clas[c]] * cell_coef[c].
+    # Folded generates a list of possible transformation matricies for each cell. The actual cell matrices are then given by A_cell[c] = folded[clas[c]] * cell_coef[c].
  
-folded_ref = np.einsum("pai,kij,pjb->pkab", T, refs, Tt, optimize=True) # T R T^T
+    folded_ref = np.einsum("pai,kij,pjb->pkab", T, refs, Tt, optimize=True) # T R T^T
 
-dofmap = V.dofmap.list
-ndofs = V.dofmap.index_map.size_local
-dofs_per_cell = dofmap.shape[1]
+    dofmap = V.dofmap.list
+    ndofs = V.dofmap.index_map.size_local
+    dofs_per_cell = dofmap.shape[1]
 
-n_classes = len(uperms) # note max 4! classes.
+    n_classes = len(uperms) # note max 4! classes.
 
-# Group all the cells that share the class
-cells_in_class = [np.flatnonzero(clas == k) for k in range(n_classes)]
+    # Group all the cells that share the class
+    cells_in_class = [np.flatnonzero(clas == k) for k in range(n_classes)]
 
 def matvec(x):
     """y = A x, without ever forming A (or even A_cell)."""
@@ -155,52 +156,54 @@ def matvec(x):
 
 
 # Check against the assembled operator.
-u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
-a = form((ufl.inner(ufl.curl(u), ufl.curl(v)) + ufl.inner(u, v)) * ufl.dx)
-A = assemble_matrix(a)
-A.scatter_reverse()
+if __name__ == "__main__":
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    a = form((ufl.inner(ufl.curl(u), ufl.curl(v)) + ufl.inner(u, v)) * ufl.dx)
+    A = assemble_matrix(a)
+    A.scatter_reverse()
 
-x = np.random.default_rng(0).standard_normal(ndofs)
-reference = A.to_scipy() @ x
-mine = matvec(x)
-print(f"dofs {ndofs}, cells {n_cells}, classes {len(uperms)}")
-print("relative error:", np.linalg.norm(mine - reference) / np.linalg.norm(reference))
-
-
-# Interpolation operator - Matrix Free
-
-e_low = basix.create_element(
-    ElementFamily.N1E, CellType.tetrahedron, 1, lagrange_variant=LagrangeVariant.legendre
-)
-e_high = basix.create_element(
-    ElementFamily.N1E, CellType.tetrahedron, 2, lagrange_variant=LagrangeVariant.legendre
-)
-
-ufl_element_low = basix.ufl.wrap_element(e_low)
-ufl_element_high = basix.ufl.wrap_element(e_high)
-
-V_low = fem.functionspace(cube_mesh, ufl_element_low)
-V_high = fem.functionspace(cube_mesh, ufl_element_high)
-
-ndofs_low = V_low.dofmap.index_map.size_local
-ndofs_high = V_high.dofmap.index_map.size_local
-
-interp_matrix = interpolation_matrix(V_low, V_high)
-interp_matrix.assemble()
-print(f"interpolation matrix size: {interp_matrix.getSize()}")
+    x = np.random.default_rng(0).standard_normal(ndofs)
+    reference = A.to_scipy() @ x
+    mine = matvec(x)
+    print(f"dofs {ndofs}, cells {n_cells}, classes {len(uperms)}")
+    print("relative error:", np.linalg.norm(mine - reference) / np.linalg.norm(reference))
 
 
-# Get global DoF indices for cell 0
-dofs_low_cell0 = V_low.dofmap.cell_dofs(0)
-dofs_high_cell0 = V_high.dofmap.cell_dofs(0)
+    # Interpolation operator - Matrix Free
 
-print(f"Cell 0 low-order global DoF indices: {dofs_low_cell0}")
-print(f"Cell 0 high-order global DoF indices: {dofs_high_cell0}")
+    e_low = basix.create_element(
+        ElementFamily.N1E, CellType.tetrahedron, 1, lagrange_variant=LagrangeVariant.legendre
+    )
+    e_high = basix.create_element(
+        ElementFamily.N1E, CellType.tetrahedron, 2, lagrange_variant=LagrangeVariant.legendre
+    )
+
+    ufl_element_low = basix.ufl.wrap_element(e_low)
+    ufl_element_high = basix.ufl.wrap_element(e_high)
+
+    V_low = fem.functionspace(cube_mesh, ufl_element_low)
+    V_high = fem.functionspace(cube_mesh, ufl_element_high)
+
+    ndofs_low = V_low.dofmap.index_map.size_local
+    ndofs_high = V_high.dofmap.index_map.size_local
+
+    interp_matrix = interpolation_matrix(V_low, V_high)
+    interp_matrix.assemble()
+    print(f"interpolation matrix size: {interp_matrix.getSize()}")
+
+
+    # Get global DoF indices for cell 0
+    dofs_low_cell0 = V_low.dofmap.cell_dofs(0)
+    dofs_high_cell0 = V_high.dofmap.cell_dofs(0)
+
+    print(f"Cell 0 low-order global DoF indices: {dofs_low_cell0}")
+    print(f"Cell 0 high-order global DoF indices: {dofs_high_cell0}")
 
 
 def fold_interpolation(V_src, V_dst, element_src, element_dst, uperms):
     """
-        B_folded[p] = Td_p · B_ref · Ts_p. 
+        B_folded[p] = Td_p · B_ref · Ts_p. These create a small cell matrices for each permutation class.
+        The actual cell matrices are then given by B_cell[c] = B_folded[clas[c]].            
     """
 
     B_ref_cell = np.ascontiguousarray(basix.compute_interpolation_operator(element_src, element_dst))
@@ -209,7 +212,8 @@ def fold_interpolation(V_src, V_dst, element_src, element_dst, uperms):
 
     return np.einsum("pdi,ij,pjs->pds", Td, B_ref_cell, Ts, optimize=True)
 
-B_folded = fold_interpolation(V_low, V_high, e_low, e_high, uperms)
+if __name__ == "__main__":
+    B_folded = fold_interpolation(V_low, V_high, e_low, e_high, uperms)
 
 
 def interpolation_mat_free(x, V_low, V_high):
@@ -222,22 +226,23 @@ def interpolation_mat_free(x, V_low, V_high):
     return y[:ndofs_high] / mult
 
 
-rng = np.random.default_rng(0)
-x = rng.standard_normal(ndofs_low)
-y_mf = interpolation_mat_free(x, V_low, V_high)
+if __name__ == "__main__":
+    rng = np.random.default_rng(0)
+    x = rng.standard_normal(ndofs_low)
+    y_mf = interpolation_mat_free(x, V_low, V_high)
 
-x_petsc = interp_matrix.createVecRight()   # size = ndofs_low
-y_petsc = interp_matrix.createVecLeft()    # size = ndofs_high
-x_petsc.array_w[:] = x
-interp_matrix.mult(x_petsc, y_petsc)
-y_assembled = y_petsc.array_r.copy()
+    x_petsc = interp_matrix.createVecRight()   # size = ndofs_low
+    y_petsc = interp_matrix.createVecLeft()    # size = ndofs_high
+    x_petsc.array_w[:] = x
+    interp_matrix.mult(x_petsc, y_petsc)
+    y_assembled = y_petsc.array_r.copy()
 
-# Compare
-error = np.linalg.norm(y_mf - y_assembled)
-relative_error = error / np.linalg.norm(y_assembled)
+    # Compare
+    error = np.linalg.norm(y_mf - y_assembled)
+    relative_error = error / np.linalg.norm(y_assembled)
 
-print("||B_mf x - B x|| =", error)
-print("relative error   =", relative_error)
+    print("||B_mf x - B x|| =", error)
+    print("relative error   =", relative_error)
 
 def discrete_gradient_reference_matrix(element_h1, element_curl):
 
@@ -250,17 +255,18 @@ def discrete_gradient_reference_matrix(element_h1, element_curl):
 
 # Test 
 
-element_h1 = basix.create_element(
-    ElementFamily.P, CellType.tetrahedron, degree,
-    lagrange_variant=LagrangeVariant.gll_warped
-)
+if __name__ == "__main__":
+    element_h1 = basix.create_element(
+        ElementFamily.P, CellType.tetrahedron, degree,
+        lagrange_variant=LagrangeVariant.gll_warped
+    )
 
-element_curl = basix.create_element(
-    ElementFamily.N1E, CellType.tetrahedron, degree,
-    lagrange_variant=LagrangeVariant.legendre
-)
+    element_curl = basix.create_element(
+        ElementFamily.N1E, CellType.tetrahedron, degree,
+        lagrange_variant=LagrangeVariant.legendre
+    )
 
-discrete_grad_ref = discrete_gradient_reference_matrix(element_h1, element_curl)
+    discrete_grad_ref = discrete_gradient_reference_matrix(element_h1, element_curl)
 
 
 
@@ -282,57 +288,58 @@ def fold_discrete_gradient(V_lagrange, V_nedelec, element_lagrange, element_nede
     return G_folded
 
 
-V_lag = fem.functionspace(cube_mesh, basix.ufl.wrap_element(element_h1))
-V_ned = fem.functionspace(cube_mesh, basix.ufl.wrap_element(element_curl))
+if __name__ == "__main__":
+    V_lag = fem.functionspace(cube_mesh, basix.ufl.wrap_element(element_h1))
+    V_ned = fem.functionspace(cube_mesh, basix.ufl.wrap_element(element_curl))
 
-dofmap_lag = V_lag.dofmap.list
-dofmap_ned = V_ned.dofmap.list
+    dofmap_lag = V_lag.dofmap.list
+    dofmap_ned = V_ned.dofmap.list
 
-n_dofs_ned = V_ned.dofmap.index_map.size_local
-
-
-"""y = G x, one cell at a time."""
-dofmap_lag = V_lag.dofmap.list
-dofmap_ned = V_ned.dofmap.list
-n_dofs_ned = V_ned.dofmap.index_map.size_local
-
-im_lag = V_lag.dofmap.index_map
-im_ned = V_ned.dofmap.index_map
-n_lag_all = im_lag.size_local + im_lag.num_ghosts
-n_ned_all = im_ned.size_local + im_ned.num_ghosts
-
-x = np.random.default_rng(0).standard_normal(n_lag_all)   # an H1 vector, not the N1E one above
-y = np.zeros(n_ned_all)                   # output vector, one entry per Nédélec DOF
-G_folded = fold_discrete_gradient(V_lag, V_ned, element_h1, element_curl, uperms)
-
-for c in range(n_cells):
-    lag_dofs = dofmap_lag[c]
-    ned_dofs = dofmap_ned[c]
-
-    x_local = x[lag_dofs]
-
-    k = clas[c]
-    G_local = G_folded[k]
-
-    y_local = G_local @ x_local  
-
-    y[ned_dofs] = y_local
-
-G_petsc = discrete_gradient(V_lag, V_ned)
-G_petsc.assemble()
+    n_dofs_ned = V_ned.dofmap.index_map.size_local
 
 
-# yp (ned) = G * xp(Lag)
-xp = G_petsc.createVecRight()
-yp = G_petsc.createVecLeft()
+    """y = G x, one cell at a time."""
+    dofmap_lag = V_lag.dofmap.list
+    dofmap_ned = V_ned.dofmap.list
+    n_dofs_ned = V_ned.dofmap.index_map.size_local
 
-n_lag = xp.getLocalSize()
-xp.array_w[:] = x[:n_lag]
+    im_lag = V_lag.dofmap.index_map
+    im_ned = V_ned.dofmap.index_map
+    n_lag_all = im_lag.size_local + im_lag.num_ghosts
+    n_ned_all = im_ned.size_local + im_ned.num_ghosts
 
-G_petsc.mult(xp, yp)                   # yp = G x
-y_petsc = yp.array_r.copy()
+    x = np.random.default_rng(0).standard_normal(n_lag_all)   # an H1 vector, not the N1E one above
+    y = np.zeros(n_ned_all)                   # output vector, one entry per Nédélec DOF
+    G_folded = fold_discrete_gradient(V_lag, V_ned, element_h1, element_curl, uperms)
 
-print("Error is ", norm(y - y_petsc))
+    for c in range(n_cells):
+        lag_dofs = dofmap_lag[c]
+        ned_dofs = dofmap_ned[c]
+
+        x_local = x[lag_dofs]
+
+        k = clas[c]
+        G_local = G_folded[k]
+
+        y_local = G_local @ x_local  
+
+        y[ned_dofs] = y_local
+
+    G_petsc = discrete_gradient(V_lag, V_ned)
+    G_petsc.assemble()
+
+
+    # yp (ned) = G * xp(Lag)
+    xp = G_petsc.createVecRight()
+    yp = G_petsc.createVecLeft()
+
+    n_lag = xp.getLocalSize()
+    xp.array_w[:] = x[:n_lag]
+
+    G_petsc.mult(xp, yp)                   # yp = G x
+    y_petsc = yp.array_r.copy()
+
+    print("Error is ", norm(y - y_petsc))
 
 def boundary_dof_mask(V):
     """Gives an array 0s and 1s"""
@@ -348,9 +355,10 @@ def boundary_dof_mask(V):
     return mask
 
 
-bc_mask = boundary_dof_mask(V)[:ndofs]      # M:    1 on the boundary, 0 inside
-keep_mask = 1.0 - bc_mask                   # I - M: 0 on the boundary, 1 inside
-print(f"bc dofs: {int(bc_mask.sum())} of {ndofs}")
+if __name__ == "__main__":
+    bc_mask = boundary_dof_mask(V)[:ndofs]      # M:    1 on the boundary, 0 inside
+    keep_mask = 1.0 - bc_mask                   # I - M: 0 on the boundary, 1 inside
+    print(f"bc dofs: {int(bc_mask.sum())} of {ndofs}")
 
 
 def cell_matrix(c):
@@ -383,20 +391,21 @@ def diagonal_bc():
     return keep_mask * d + bc_mask      # 1 on the bc diagonal
 
 
-g = fem.Function(V)
-bc = fem.dirichletbc(g, np.flatnonzero(boundary_dof_mask(V)))
-A_bc = assemble_matrix(a, bcs=[bc])
-A_bc.scatter_reverse()
+if __name__ == "__main__":
+    g = fem.Function(V)
+    bc = fem.dirichletbc(g, np.flatnonzero(boundary_dof_mask(V)))
+    A_bc = assemble_matrix(a, bcs=[bc])
+    A_bc.scatter_reverse()
 
-x = np.random.default_rng(0).standard_normal(ndofs)
-A_bc_sparse = A_bc.to_scipy()
-ref = A_bc_sparse @ x
-print("matvec_bc relative error:",
-      np.linalg.norm(matvec_bc(x) - ref) / np.linalg.norm(ref))
+    x = np.random.default_rng(0).standard_normal(ndofs)
+    A_bc_sparse = A_bc.to_scipy()
+    ref = A_bc_sparse @ x
+    print("matvec_bc relative error:",
+          np.linalg.norm(matvec_bc(x) - ref) / np.linalg.norm(ref))
 
-ref_diag = A_bc_sparse.diagonal()
-print("diagonal_bc relative error:",
-      np.linalg.norm(diagonal_bc() - ref_diag) / np.linalg.norm(ref_diag))
+    ref_diag = A_bc_sparse.diagonal()
+    print("diagonal_bc relative error:",
+          np.linalg.norm(diagonal_bc() - ref_diag) / np.linalg.norm(ref_diag))
 
 def apply_transfer(x, V_src, V_dst, B_folded, clas):
     """Calculate y = B @ x without explicitly constructing B."""
@@ -435,33 +444,34 @@ def apply_transfer_transpose(x, V_src, V_dst, B_folded, clas):
 
     return y
 
-V_src = V_low
-V_dst = V_high
-x = np.random.default_rng(0).standard_normal(V_src.dofmap.index_map.size_local)
+if __name__ == "__main__":
+    V_src = V_low
+    V_dst = V_high
+    x = np.random.default_rng(0).standard_normal(V_src.dofmap.index_map.size_local)
 
-y = apply_transfer(x, V_src, V_dst, B_folded, clas)
+    y = apply_transfer(x, V_src, V_dst, B_folded, clas)
 
-P = interpolation_matrix(V_src, V_dst)
-P.assemble()
-xp, yp = P.createVecRight(), P.createVecLeft()
-xp.array_w[:] = x
-P.mult(xp, yp) # y = P x
-ref = yp.array_r.copy()
+    P = interpolation_matrix(V_src, V_dst)
+    P.assemble()
+    xp, yp = P.createVecRight(), P.createVecLeft()
+    xp.array_w[:] = x
+    P.mult(xp, yp) # y = P x
+    ref = yp.array_r.copy()
 
-y = apply_transfer(x, V_src, V_dst, B_folded, clas)
-print("apply_transfer relative error:", np.linalg.norm(y - ref) / np.linalg.norm(ref))
+    y = apply_transfer(x, V_src, V_dst, B_folded, clas)
+    print("apply_transfer relative error:", np.linalg.norm(y - ref) / np.linalg.norm(ref))
 
-# Test apply_transfer_transpose
-x = np.random.default_rng(0).standard_normal(V_dst.dofmap.index_map.size_local)
-y = apply_transfer_transpose(x, V_src, V_dst, B_folded, clas)
-P = interpolation_matrix(V_src, V_dst)
-P.assemble()
-xp, yp = P.createVecRight(), P.createVecLeft()
-yp.array_w[:] = x
-P.multTranspose(yp, xp) # y = P^T x
-ref = xp.array_r.copy()
-y = apply_transfer_transpose(x, V_src, V_dst, B_folded, clas)
-print("apply_transfer_transpose relative error:", np.linalg.norm(y - ref) / np.linalg.norm(ref))
+    # Test apply_transfer_transpose
+    x = np.random.default_rng(0).standard_normal(V_dst.dofmap.index_map.size_local)
+    y = apply_transfer_transpose(x, V_src, V_dst, B_folded, clas)
+    P = interpolation_matrix(V_src, V_dst)
+    P.assemble()
+    xp, yp = P.createVecRight(), P.createVecLeft()
+    yp.array_w[:] = x
+    P.multTranspose(yp, xp) # y = P^T x
+    ref = xp.array_r.copy()
+    y = apply_transfer_transpose(x, V_src, V_dst, B_folded, clas)
+    print("apply_transfer_transpose relative error:", np.linalg.norm(y - ref) / np.linalg.norm(ref))
 
 
 def get_diagonal():
@@ -475,14 +485,15 @@ def get_diagonal():
         d[dofs] += np.diag(A_cell)
     return d
 
-A_mat = assemble_matrix(a)
-A_mat.scatter_reverse()
-A_mat_sp = A_mat.to_scipy()
-print("A_mat_sp.diagonal():", A_mat_sp.diagonal())
-diag_assembled = A_mat_sp.diagonal()
-diag_computed = get_diagonal()
+if __name__ == "__main__":
+    A_mat = assemble_matrix(a)
+    A_mat.scatter_reverse()
+    A_mat_sp = A_mat.to_scipy()
+    print("A_mat_sp.diagonal():", A_mat_sp.diagonal())
+    diag_assembled = A_mat_sp.diagonal()
+    diag_computed = get_diagonal()
 
-print("Relative error:", np.linalg.norm(diag_computed - diag_assembled) / np.linalg.norm(diag_assembled))
+    print("Relative error:", np.linalg.norm(diag_computed - diag_assembled) / np.linalg.norm(diag_assembled))
 
 
 
@@ -537,46 +548,49 @@ class CurlCurlMatFree:
 
 # building level 1 of pmg:
 
-n = 8
-degree_ladder = [1, 2, 3]
-msh = mesh.create_unit_cube(MPI.COMM_WORLD, n, n, n)
-cell_coef = piola_map(msh)
+if __name__ == "__main__":
+    n = 8
+    degree_ladder = [1, 2, 3]
+    msh = mesh.create_unit_cube(MPI.COMM_WORLD, n, n, n)
+    cell_coef = piola_map(msh)
 
-clas, uperms = permutation_classes(msh)
+    clas, uperms = permutation_classes(msh)
 
-p = 1
-# building levels
-e1 = basix.create_element(ElementFamily.N1E, CellType.tetrahedron, p,
-                          lagrange_variant=LagrangeVariant.legendre)
+    p = 1
+    # building levels
+    e1 = basix.create_element(ElementFamily.N1E, CellType.tetrahedron, p,
+                              lagrange_variant=LagrangeVariant.legendre)
 
-V1 = fem.functionspace(msh, basix.ufl.wrap_element(e1))
-dofmap1 = V1.dofmap.list
-print("dofs per cell:", dofmap1.shape[1])                # 6, one per edge
-print("total dofs:", V1.dofmap.index_map.size_local)     # 4184, the number of edges
+    V1 = fem.functionspace(msh, basix.ufl.wrap_element(e1))
+    dofmap1 = V1.dofmap.list
+    print("dofs per cell:", dofmap1.shape[1])                # 6, one per edge
+    print("total dofs:", V1.dofmap.index_map.size_local)     # 4184, the number of edges
 
-refs1 = curlcurl_reference_matrix(e1, quadrature_degree=2 * p + 2)
-print("refs:", refs1.shape)      
+    refs1 = curlcurl_reference_matrix(e1, quadrature_degree=2 * p + 2)
+    print("refs:", refs1.shape)      
 
-T1  = dense_transform(V1, "T",  uperms)
-Tt1 = dense_transform(V1, "Tt", uperms)
-print("T:", T1.shape)
+    T1  = dense_transform(V1, "T",  uperms)
+    Tt1 = dense_transform(V1, "Tt", uperms)
+    print("T:", T1.shape)
 
-folded_ref1 = np.einsum("pai,kij,pjb->pkab", T1, refs1, Tt1, optimize=True)
-print("folded_ref:", folded_ref1.shape)                   
+    folded_ref1 = np.einsum("pai,kij,pjb->pkab", T1, refs1, Tt1, optimize=True)
+    print("folded_ref:", folded_ref1.shape)                   
 
-A1 = CurlCurlMatFree(V1, folded_ref1, cell_coef, clas, dofmap1)
-inv_diag1 = 1.0 / A1.diagonal()
+    A1 = CurlCurlMatFree(V1, folded_ref1, cell_coef, clas, dofmap1)
+    inv_diag1 = 1.0 / A1.diagonal()
 
 
-u, v = ufl.TrialFunction(V1), ufl.TestFunction(V1)
-a1 = form((ufl.inner(ufl.curl(u), ufl.curl(v)) + ufl.inner(u, v)) * ufl.dx)
-A1_ref = assemble_matrix(a1)
-A1_ref.scatter_reverse()
-A1_sp = A1_ref.to_scipy()
+    u, v = ufl.TrialFunction(V1), ufl.TestFunction(V1)
+    a1 = form((ufl.inner(ufl.curl(u), ufl.curl(v)) + ufl.inner(u, v)) * ufl.dx)
+    A1_ref = assemble_matrix(a1)
+    A1_ref.scatter_reverse()
+    A1_sp = A1_ref.to_scipy()
 
 def rel(a, b):
     return np.linalg.norm(a - b) / np.linalg.norm(b)
 
-x = np.random.default_rng(0).standard_normal(A1.ndofs)
-print("matvec:  ", rel(A1.matvec(x), A1_sp @ x))              # ~1e-15
-print("diagonal:", rel(A1.diagonal(), A1_sp.diagonal()))      # ~1e-15
+if __name__ == "__main__":
+    x = np.random.default_rng(0).standard_normal(A1.ndofs)
+    print("matvec:  ", rel(A1.matvec(x), A1_sp @ x))              # ~1e-15
+    print("diagonal:", rel(A1.diagonal(), A1_sp.diagonal()))      # ~1e-15
+
