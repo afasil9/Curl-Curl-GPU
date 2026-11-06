@@ -1,6 +1,8 @@
 #%%
 import numpy as np
+import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+import ufl
 from dolfinx import fem, mesh
 from dolfinx.fem import assemble_matrix
 from mpi4py import MPI
@@ -120,6 +122,35 @@ def chebyshev(lvl, b, x, steps=2, lower=0.3):
     return x
 
 
+def coarse_matrix(lvl):
+
+    V = lvl["V"]
+    msh = V.mesh
+    tdim = msh.topology.dim
+    msh.topology.create_connectivity(tdim - 1, tdim)
+    facets = mesh.exterior_facet_indices(msh.topology)
+    bc = fem.dirichletbc(fem.Function(V),
+                         fem.locate_dofs_topological(V, tdim - 1, facets))
+
+    u, v = ufl.TrialFunction(V), ufl.TestFunction(V)
+    a = fem.form((ufl.inner(ufl.curl(u), ufl.curl(v)) + ufl.inner(u, v)) * ufl.dx)
+
+    A_csr = fem.assemble_matrix(a, bcs=[bc], diag=1.0)
+    A_csr.scatter_reverse()
+
+    nd = lvl["ndofs"] 
+    A_sp = A_csr.to_scipy().tocsr()[:nd, :nd].tocsc()
+    A_sp.eliminate_zeros()  
+    return A_sp
+
+
+def coarse_lu(lvl):
+    """
+    Coarse Direct solve
+    """
+    return spla.splu(coarse_matrix(lvl))
+
+
 n = 8
 degree_ladder = [1, 2, 3]
 msh = mesh.create_unit_cube(MPI.COMM_WORLD, n, n, n)
@@ -161,6 +192,21 @@ coarse_lvl = fine_lvl - 1
 # A e_c = r_c
 e_c = chebyshev(levels[coarse_lvl], r_c, np.zeros_like(r_c), steps=5)
 
+r_remaining = r_c - A(levels[coarse_lvl], e_c)
+low_lvl = coarse_lvl - 1
+
+r_cc = levels[low_lvl]["mask"] * apply_transfer_transpose(
+        levels[coarse_lvl]["mask"] * r_remaining,
+        levels[low_lvl]["V"],       # V_src = coarse 
+        levels[coarse_lvl]["V"],    # V_dst = fine   
+        transfers[low_lvl],
+        clas)
 
 
-# %%
+# Bottom of the ladder: solve exactly instead of smoothing.
+lu = coarse_lu(levels[low_lvl])
+e_0 = lu.solve(r_cc)
+
+print("coarse solve residual:",
+      np.linalg.norm(A(levels[low_lvl], e_0) - r_cc) / np.linalg.norm(r_cc))
+
