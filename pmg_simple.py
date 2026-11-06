@@ -3,7 +3,7 @@ import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
 import ufl
-from dolfinx import fem, mesh
+from dolfinx import fem, la, mesh
 from dolfinx.fem import assemble_matrix
 from mpi4py import MPI
 from basix import CellType, ElementFamily, LagrangeVariant
@@ -150,6 +150,21 @@ def coarse_lu(lvl):
     """
     return spla.splu(coarse_matrix(lvl))
 
+def exact_solution(msh):
+    x = ufl.SpatialCoordinate(msh)
+    pi = np.pi
+    return ufl.as_vector((ufl.sin(pi * x[1]) * ufl.sin(pi * x[2]),
+                          ufl.sin(pi * x[0]) * ufl.sin(pi * x[2]),
+                          ufl.sin(pi * x[0]) * ufl.sin(pi * x[1])))
+
+
+def manufactured_rhs(lvl, u_ex):
+    v = ufl.TestFunction(lvl["V"])
+    f = ufl.curl(ufl.curl(u_ex)) + u_ex
+    b = fem.assemble_vector(fem.form(ufl.inner(f, v) * ufl.dx))
+    b.scatter_reverse(la.InsertMode.add)
+    return lvl["mask"] * b.array[:lvl["ndofs"]]
+
 
 n = 8
 degree_ladder = [1, 2, 3]
@@ -163,8 +178,9 @@ levels = [build_level(msh, d, clas, uperms, cell_coef) for d in degree_ladder]
 
 
 fine_lvl = len(levels) - 1
-x_true = levels[fine_lvl]["mask"] * np.random.default_rng(0).standard_normal(levels[fine_lvl]["ndofs"])
-b = A(levels[fine_lvl], x_true)
+
+u_ex   = exact_solution(msh)
+b      = manufactured_rhs(levels[fine_lvl], u_ex)
 
 #Initial guess 0
 x = np.zeros_like(b)
