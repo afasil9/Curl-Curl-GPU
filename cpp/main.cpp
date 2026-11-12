@@ -60,6 +60,17 @@ std::ostream& operator<<(std::ostream& os, const std::vector<T>& vec) {
 }
 
 
+double determinant(std::vector<std::vector<double>> J)
+{
+    double detJ;
+
+    detJ = J[0][0] * (J[1][1] * J[2][2] - J[1][2] * J[2][1]) -
+           J[0][1] * (J[1][0] * J[2][2] - J[1][2] * J[2][0]) +
+           J[0][2] * (J[1][0] * J[2][1] - J[1][1] * J[2][0]);
+    return detJ;
+}
+
+
 void piola_map(auto msh){
     auto x = msh->geometry().x(); // Coordiantes of mesh verts x = [x0, y0, z0, x1, y1, z1, ...]
     auto v = msh->geometry().dofmaps().front();
@@ -79,6 +90,8 @@ void piola_map(auto msh){
     // std::cout << "size of x is " << x.size() << std::endl;
 
     std::vector<std::vector<std::vector<double>>> J(n_cells, std::vector<std::vector<double>>(3, std::vector<double>(3, 0.0)));
+    std::vector<std::vector<double>> detJ(n_cells, std::vector<double>(1, 0.0));
+    std::vector<std::vector<std::vector<double>>> Jinv(n_cells, std::vector<std::vector<double>>(3, std::vector<double>(3, 0.0)));
 
     // e0 (x1 - x0, y1 - y0, z1 - z0)
     e0 = {x[3*node1 + 0] - x[3*node0 + 0], x[3*node1 + 1] - x[3*node0 + 1], x[3*node1 + 2] - x[3*node0 + 2]};
@@ -99,12 +112,18 @@ void piola_map(auto msh){
         J[cell][1][0] = e0[1];
         J[cell][2][0] = e0[2];
     }
+
+    for (int cell = 0; cell < n_cells; cell++){
+        detJ[cell][0] = determinant(J[cell]);
+    }
     // std::cout << J << std::endl;
     // std::cout << "\n" << std::endl;
 
-    for (std::size_t c = 0; c < J.size(); c++) {
-    std::cout << "cell " << c << ": " << J[c] << "\n";
-}
+    // for (std::size_t c = 0; c < J.size(); c++) {
+    // std::cout << "cell " << c << ": " << J[c] << "\n";
+// }
+    
+    std::cout << "det(J) for cell 0: " << determinant(J[0]) << "\n";
 
 }
 
