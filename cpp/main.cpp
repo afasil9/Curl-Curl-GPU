@@ -70,6 +70,25 @@ double determinant(std::vector<std::vector<double>> J)
     return detJ;
 }
 
+void inverse(const std::vector<std::vector<double>> J, std::vector<std::vector<double>> &Jinv)
+{
+    double detJ = determinant(J);
+
+
+
+    Jinv[0][0] = (J[1][1] * J[2][2] - J[1][2] * J[2][1]) / detJ;
+    Jinv[0][1] = (J[0][2] * J[2][1] - J[0][1] * J[2][2]) / detJ;
+    Jinv[0][2] = (J[0][1] * J[1][2] - J[0][2] * J[1][1]) / detJ;
+
+    Jinv[1][0] = (J[1][2] * J[2][0] - J[1][0] * J[2][2]) / detJ;
+    Jinv[1][1] = (J[0][0] * J[2][2] - J[0][2] * J[2][0]) / detJ;
+    Jinv[1][2] = (J[0][2] * J[1][0] - J[0][0] * J[1][2]) / detJ;
+
+    Jinv[2][0] = (J[1][0] * J[2][1] - J[1][1] * J[2][0]) / detJ;
+    Jinv[2][1] = (J[0][1] * J[2][0] - J[0][0] * J[2][1]) / detJ;
+    Jinv[2][2] = (J[0][0] * J[1][1] - J[0][1] * J[1][0]) / detJ;
+}
+
 
 void piola_map(auto msh){
     auto x = msh->geometry().x(); // Coordiantes of mesh verts x = [x0, y0, z0, x1, y1, z1, ...]
@@ -90,7 +109,7 @@ void piola_map(auto msh){
     // std::cout << "size of x is " << x.size() << std::endl;
 
     std::vector<std::vector<std::vector<double>>> J(n_cells, std::vector<std::vector<double>>(3, std::vector<double>(3, 0.0)));
-    std::vector<std::vector<double>> detJ(n_cells, std::vector<double>(1, 0.0));
+    std::vector<double> detj(n_cells, 0.0);
     std::vector<std::vector<std::vector<double>>> Jinv(n_cells, std::vector<std::vector<double>>(3, std::vector<double>(3, 0.0)));
 
     // e0 (x1 - x0, y1 - y0, z1 - z0)
@@ -108,13 +127,29 @@ void piola_map(auto msh){
             e2[edge] = x[3*node3 + edge] - x[3*node0 + edge];
         }
         // J[cell][row][col] = e[row][col]
+
+        //         |  e0[0]  e1[0]  e2[0]  |   |  x1-x0  x2-x0  x3-x0  |
+        // J     = |  e0[1]  e1[1]  e2[1]  | = |  y1-y0  y2-y0  y3-y0  |
+        //         |  e0[2]  e1[2]  e2[2]  |   |  z1-z0  z2-z0  z3-z0  |
+
         J[cell][0][0] = e0[0];
         J[cell][1][0] = e0[1];
         J[cell][2][0] = e0[2];
+
+        J[cell][0][1] = e1[0];
+        J[cell][1][1] = e1[1];
+        J[cell][2][1] = e1[2];
+
+        J[cell][0][2] = e2[0];
+        J[cell][1][2] = e2[1];
+        J[cell][2][2] = e2[2];
     }
 
-    for (int cell = 0; cell < n_cells; cell++){
-        detJ[cell][0] = determinant(J[cell]);
+
+    std::cout << "DetJ array is" << detj << std::endl;
+    for (int c = 0; c < n_cells; c++){
+        detj[c] = std::abs(determinant(J[c]));
+        inverse(J[c], Jinv[c]);
     }
     // std::cout << J << std::endl;
     // std::cout << "\n" << std::endl;
@@ -124,6 +159,11 @@ void piola_map(auto msh){
 // }
     
     std::cout << "det(J) for cell 0: " << determinant(J[0]) << "\n";
+
+    for (std::size_t c = 0; c < detj.size(); c++) {
+        // std::cout << "det(J) for cell " << c << ": " << detj[c] << "\n";
+        std::cout << "Jinv for cell " << c << ": " << Jinv[c] << "\n";
+    }
 
 }
 
