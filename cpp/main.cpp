@@ -156,12 +156,12 @@ void piola_map(auto msh){
 
     // Curl coefficients
     std::vector<double> H(n_cells * 9, 0.0);
-    for (std::size_t c = 0; c < n_cells; c++)
-        for (int i = 0; i < 3; i++)
-            for (int j = 0; j < 3; j++)
-                for (int k = 0; k < 3; k++)
-                    H[id3(c, i, j)] += J[id3(c, i, k)] * J[id3(c, j, k)];
-    
+    for (std::size_t c = 0; c < n_cells; ++c)
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                for (int k = 0; k < 3; ++k)
+                    H[id3(c, i, j)] += J[id3(c, k, i)] * J[id3(c, k, j)];
+        
 
     // std::cout << "J for cell 0:\n";
     // print_mat3(&J[9 * 0]);
@@ -173,32 +173,26 @@ void piola_map(auto msh){
     // std::cout << "H for cell 0:\n";
     // print_mat3(&H[9 * 0]);
 
-    std::vector<double> coeffs(n_cells * 18, 0.0);
+    std::vector<double> coeffs(n_cells * 12, 0.0);
 
 
     for (int c =0; c< n_cells; c++){
-        coeffs[18 * c + 0] = detj[c] * G[id3(c, 0, 0)];   // u_x * v_x
-        coeffs[18 * c + 1] = detj[c] * G[id3(c, 0, 1)];   // u_x * v_y
-        coeffs[18 * c + 2] = detj[c] * G[id3(c, 0, 2)];
-        coeffs[18 * c + 3] = detj[c] * G[id3(c, 1, 0)];
-        coeffs[18 * c + 4] = detj[c] * G[id3(c, 1, 1)];
-        coeffs[18 * c + 5] = detj[c] * G[id3(c, 1, 2)];
-        coeffs[18 * c + 6] = detj[c] * G[id3(c, 2, 0)];
-        coeffs[18 * c + 7] = detj[c] * G[id3(c, 2, 1)];
-        coeffs[18 * c + 8] = detj[c] * G[id3(c, 2, 2)];
+        // Six mass coefficients
+        coeffs[12 * c + 0] = detj[c] * G[id3(c, 0, 0)]; // G00
+        coeffs[12 * c + 1] = detj[c] * G[id3(c, 1, 1)]; // G11
+        coeffs[12 * c + 2] = detj[c] * G[id3(c, 2, 2)]; // G22
+        coeffs[12 * c + 3] = detj[c] * G[id3(c, 0, 1)]; // G01 = G10
+        coeffs[12 * c + 4] = detj[c] * G[id3(c, 0, 2)]; // G02 = G20
+        coeffs[12 * c + 5] = detj[c] * G[id3(c, 1, 2)]; // G12 = G21
 
-        coeffs[18 * c + 9] = H[id3(c, 0, 0)] / detj[c];
-        coeffs[18 * c + 10] = H[id3(c, 0, 1)] / detj[c];
-        coeffs[18 * c + 11] = H[id3(c, 0, 2)] / detj[c];
-        coeffs[18 * c + 12] = H[id3(c, 1, 0)] / detj[c];
-        coeffs[18 * c + 13] = H[id3(c, 1, 1)] / detj[c];
-        coeffs[18 * c + 14] = H[id3(c, 1, 2)] / detj[c];
-        coeffs[18 * c + 15] = H[id3(c, 2, 0)] / detj[c];
-        coeffs[18 * c + 16] = H[id3(c, 2, 1)] / detj[c];
-        coeffs[18 * c + 17] = H[id3(c, 2, 2)] / detj[c];
+        // Six curl-curl coefficients
+        coeffs[12 * c + 6]  = H[id3(c, 0, 0)] / detj[c]; // H00
+        coeffs[12 * c + 7]  = H[id3(c, 1, 1)] / detj[c]; // H11
+        coeffs[12 * c + 8]  = H[id3(c, 2, 2)] / detj[c]; // H22
+        coeffs[12 * c + 9]  = H[id3(c, 0, 1)] / detj[c]; // H01 = H10
+        coeffs[12 * c + 10] = H[id3(c, 0, 2)] / detj[c]; // H02 = H20
+        coeffs[12 * c + 11] = H[id3(c, 1, 2)] / detj[c]; // H12 = H21
     }
-
-
 }
 
 
