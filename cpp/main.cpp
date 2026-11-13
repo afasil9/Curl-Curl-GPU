@@ -142,11 +142,63 @@ void piola_map(auto msh){
         inverse(&J[9 * c], &Jinv[9 * c]);
     }
 
-    std::cout << "J for cell 0:\n";
-    print_mat3(&J[9 * 0]);
-    std::cout << "det(J) for cell 0: " << detj[0] << "\n";
-    std::cout << "Jinv for cell 0:\n";
-    print_mat3(&Jinv[9 * 0]);
+    // G = einsum("cik,cjk->cij", Jinv, Jinv)   ->   G_c = Jinv_c * Jinv_c^T
+    // For every cell c, and for fixed row i and j, we sum over the columns k
+
+    // Mass matrix coefficient.
+    std::vector<double> G(n_cells * 9, 0.0);
+
+    for (std::size_t c = 0; c < n_cells; c++)
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                for (int k = 0; k < 3; k++)
+                    G[id3(c, i, j)] += Jinv[id3(c, i, k)] * Jinv[id3(c, j, k)];
+
+    // Curl coefficients
+    std::vector<double> H(n_cells * 9, 0.0);
+    for (std::size_t c = 0; c < n_cells; c++)
+        for (int i = 0; i < 3; i++)
+            for (int j = 0; j < 3; j++)
+                for (int k = 0; k < 3; k++)
+                    H[id3(c, i, j)] += J[id3(c, i, k)] * J[id3(c, j, k)];
+    
+
+    // std::cout << "J for cell 0:\n";
+    // print_mat3(&J[9 * 0]);
+    // std::cout << "det(J) for cell 0: " << detj[0] << "\n";
+    // std::cout << "Jinv for cell 0:\n";
+    // print_mat3(&Jinv[9 * 0]);
+    // std::cout << "G for cell 0:\n";
+    // print_mat3(&G[9 * 0]);
+    // std::cout << "H for cell 0:\n";
+    // print_mat3(&H[9 * 0]);
+
+    std::vector<double> coeffs(n_cells * 18, 0.0);
+
+
+    for (int c =0; c< n_cells; c++){
+        coeffs[18 * c + 0] = detj[c] * G[id3(c, 0, 0)];   // u_x * v_x
+        coeffs[18 * c + 1] = detj[c] * G[id3(c, 0, 1)];   // u_x * v_y
+        coeffs[18 * c + 2] = detj[c] * G[id3(c, 0, 2)];
+        coeffs[18 * c + 3] = detj[c] * G[id3(c, 1, 0)];
+        coeffs[18 * c + 4] = detj[c] * G[id3(c, 1, 1)];
+        coeffs[18 * c + 5] = detj[c] * G[id3(c, 1, 2)];
+        coeffs[18 * c + 6] = detj[c] * G[id3(c, 2, 0)];
+        coeffs[18 * c + 7] = detj[c] * G[id3(c, 2, 1)];
+        coeffs[18 * c + 8] = detj[c] * G[id3(c, 2, 2)];
+
+        coeffs[18 * c + 9] = H[id3(c, 0, 0)] / detj[c];
+        coeffs[18 * c + 10] = H[id3(c, 0, 1)] / detj[c];
+        coeffs[18 * c + 11] = H[id3(c, 0, 2)] / detj[c];
+        coeffs[18 * c + 12] = H[id3(c, 1, 0)] / detj[c];
+        coeffs[18 * c + 13] = H[id3(c, 1, 1)] / detj[c];
+        coeffs[18 * c + 14] = H[id3(c, 1, 2)] / detj[c];
+        coeffs[18 * c + 15] = H[id3(c, 2, 0)] / detj[c];
+        coeffs[18 * c + 16] = H[id3(c, 2, 1)] / detj[c];
+        coeffs[18 * c + 17] = H[id3(c, 2, 2)] / detj[c];
+    }
+
+
 }
 
 
