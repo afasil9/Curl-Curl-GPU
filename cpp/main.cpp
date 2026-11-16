@@ -293,9 +293,35 @@ std::vector<double> curlcurl_reference_matrix(const basix::FiniteElement<double>
     std::vector<double> A;
     A.reserve(K.size() + M.size());
     A.insert(A.end(), K.begin(), K.end());  
-    A.insert(A.end(), M.begin(), M.end()); 
+    A.insert(A.end(), M.begin(), M.end());
 
     return A;
+}
+
+// Group cells by their permutation code (same as np.unique(perm, return_inverse=True)).
+//   uniq[k] = the k-th distinct permutation code
+//   clas[c] = k  means cell c has code uniq[k], so it uses folded reference matrix k
+
+struct permutation_class {
+    std::vector<std::int32_t> clas; // class index for each cell
+    std::vector<std::uint32_t> uniq; // unique permutation codes
+};
+
+permutation_class permutation_classes(auto msh)
+{
+    msh->topology_mutable()->create_cell_permutations();
+    const std::vector<std::uint32_t>& perm = msh->topology()->get_cell_permutation_info();
+    const std::size_t n_cells = msh->topology()->index_map(3)->size_local();
+
+    std::vector<std::uint32_t> uniq(perm.begin(), perm.begin() + n_cells);
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+
+    std::vector<std::int32_t> clas(n_cells);
+    for (std::size_t c = 0; c < n_cells; ++c)
+        clas[c] = std::lower_bound(uniq.begin(), uniq.end(), perm[c]) - uniq.begin();
+
+    return {clas, uniq};
 }
 
 
@@ -326,6 +352,9 @@ int main(int argc, char* argv[])
             basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
         std::vector<double> refs = curlcurl_reference_matrix(element, 2 * degree + 2);
         const std::size_t nd = element.dim();
+
+        permutation_class pc = permutation_classes(msh);
+        std::cout << "permutation classes: " << pc.uniq.size() << "\n";
         // std::cout << "refs shape: (12, " << nd << ", " << nd << ")\n";
         // std::cout << "R[0, 0, 0] = " << refs[0] << ", R[6, 0, 0] = " << refs[6 * nd * nd] << "\n";
     }
