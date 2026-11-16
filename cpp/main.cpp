@@ -1,7 +1,3 @@
-// Host-side driver: builds all the tables with Basix/DOLFINx on the CPU,
-// then hands plain arrays to the CUDA kernels declared in kernels.hpp.
-// No CUDA headers in this file -- it is compiled by the host C++ compiler.
-
 // ---- Standard library -------------------------------------------------------
 #include <algorithm> // std::sort, std::unique (permutation_classes)
 #include <array>
@@ -39,6 +35,7 @@
 // #include <dolfinx/la/MatrixCSR.h>  // coarse (degree 1) matrix
 // #include <dolfinx/la/SparsityPattern.h>
 // #include <dolfinx/la/Vector.h>
+#include <dolfinx/common/log.h>   // init_logging (required before any dolfinx call)
 #include <dolfinx/mesh/Mesh.h>
 #include <dolfinx/mesh/generation.h> // create_box (unit cube of tets)
 // #include <dolfinx/mesh/utils.h>      // exterior_facet_indices
@@ -180,21 +177,21 @@ std::vector<double> piola_map(auto msh){
 
 
     for (size_t c =0; c< n_cells; c++){
-        // Six mass coefficients
-        coeffs[12 * c + 0] = detj[c] * G[id3(c, 0, 0)]; // G00
-        coeffs[12 * c + 1] = detj[c] * G[id3(c, 1, 1)]; // G11
-        coeffs[12 * c + 2] = detj[c] * G[id3(c, 2, 2)]; // G22
-        coeffs[12 * c + 3] = detj[c] * G[id3(c, 0, 1)]; // G01 = G10
-        coeffs[12 * c + 4] = detj[c] * G[id3(c, 0, 2)]; // G02 = G20
-        coeffs[12 * c + 5] = detj[c] * G[id3(c, 1, 2)]; // G12 = G21
-
         // Six curl-curl coefficients
-        coeffs[12 * c + 6]  = H[id3(c, 0, 0)] / detj[c]; // H00
-        coeffs[12 * c + 7]  = H[id3(c, 1, 1)] / detj[c]; // H11
-        coeffs[12 * c + 8]  = H[id3(c, 2, 2)] / detj[c]; // H22
-        coeffs[12 * c + 9]  = H[id3(c, 0, 1)] / detj[c]; // H01 = H10
-        coeffs[12 * c + 10] = H[id3(c, 0, 2)] / detj[c]; // H02 = H20
-        coeffs[12 * c + 11] = H[id3(c, 1, 2)] / detj[c]; // H12 = H21
+        coeffs[12 * c + 0] = H[id3(c, 0, 0)] / detj[c]; // H00
+        coeffs[12 * c + 1] = H[id3(c, 1, 1)] / detj[c]; // H11
+        coeffs[12 * c + 2] = H[id3(c, 2, 2)] / detj[c]; // H22
+        coeffs[12 * c + 3] = H[id3(c, 0, 1)] / detj[c]; // H01 = H10
+        coeffs[12 * c + 4] = H[id3(c, 0, 2)] / detj[c]; // H02 = H20
+        coeffs[12 * c + 5] = H[id3(c, 1, 2)] / detj[c]; // H12 = H21
+
+        // Six mass coefficients
+        coeffs[12 * c + 6]  = detj[c] * G[id3(c, 0, 0)]; // G00
+        coeffs[12 * c + 7]  = detj[c] * G[id3(c, 1, 1)]; // G11
+        coeffs[12 * c + 8]  = detj[c] * G[id3(c, 2, 2)]; // G22
+        coeffs[12 * c + 9]  = detj[c] * G[id3(c, 0, 1)]; // G01 = G10
+        coeffs[12 * c + 10] = detj[c] * G[id3(c, 0, 2)]; // G02 = G20
+        coeffs[12 * c + 11] = detj[c] * G[id3(c, 1, 2)]; // G12 = G21
     }
     return coeffs;
 }
@@ -216,7 +213,6 @@ std::vector<double> curlcurl_reference_matrix(const basix::FiniteElement<double>
     basix::impl::mdspan_t<const double, 4> T(tab.data(), shape);
 
     // T (derivative, quadrature point, basis, value compnent)
-
     // 
     // Kᵢⱼ = Σ₍q₌₁₎ⁿᵠ wᵩ (∇ × φᵢ)(xᵩ) · (∇ × φⱼ)(xᵩ)
     // 
@@ -237,34 +233,76 @@ std::vector<double> curlcurl_reference_matrix(const basix::FiniteElement<double>
     // T(0, q , 0, 2) gives you z component of basis funciton 0.
     // std::cout << "phi_x = " << phi_x << ", phi_y = " << phi_y << ", phi_z = " << phi_z << "\n";
     // q - quadrature point index, i - basis function index
+
+    std::vector<double> K(6 * ndofs * ndofs, 0.0); // Stiffness matrix
+    std::vector<double> M(6 * ndofs * ndofs, 0.0); // Mass matrix
     
+    // Symmetric component pairs (a, b); matches SYM in basic_ops.py
+    constexpr int SYM[6][2] = {{0, 0}, {1, 1}, {2, 2}, {0, 1}, {0, 2}, {1, 2}};
+
+    //Curl part of the reference matrix
     for (std::size_t q = 0; q < nq; ++q)
     {
+        const double w = wts[q];
         for (std::size_t basis_i = 0; basis_i < ndofs; ++basis_i)
         {
-            // const double phi_x = T(0, q, i, 0); 
-            // const double phi_y = T(0, q, i, 1);
-            // const double phi_z = T(0, q, i, 2);
+            // Curl of basis function i (depends only on q, basis_i)
+            const std::array<double, 3> curl_i = {
+                T(2, q, basis_i, 2) - T(3, q, basis_i, 1),  // ∂y φ_i,z - ∂z φ_i,y
+                T(3, q, basis_i, 0) - T(1, q, basis_i, 2),  // ∂z φ_i,x - ∂x φ_i,z
+                T(1, q, basis_i, 1) - T(2, q, basis_i, 0)}; // ∂x φ_i,y - ∂y φ_i,x
+            
+            const std::array<double, 3> phi_i = {
+                T(0, q, basis_i, 0),
+                T(0, q, basis_i, 1),
+                T(0, q, basis_i, 2)
+            };
 
-            const double curl_x = T(2, q, basis_i, 2) - T(3, q, basis_i, 1); // ∂y φ_i,z - ∂z φ_i,y
-            const double curl_y = T(3, q, basis_i, 0) - T(1, q, basis_i, 2); // ∂z φ_i,x - ∂x φ_i,z
-            const double curl_z = T(1, q, basis_i, 1) - T(2, q, basis_i, 0); // ∂x φ_i,y - ∂y φ_i,x
-            // std::cout << "q=" << q << ", i=" << i
-            //         << ": phi_x=" << phi_x
-            //         << ", phi_y=" << phi_y
-            //         << ", phi_z=" << phi_z << "\n";
-            curls[q * ndofs + basis_i] = {{curl_x, curl_y, curl_z}};
+
+            for (std::size_t basis_j = 0; basis_j < ndofs; ++basis_j)
+            {
+                // Curl of basis function j (depends only on q, basis_j)
+                const std::array<double, 3> curl_j = {
+                    T(2, q, basis_j, 2) - T(3, q, basis_j, 1),  // ∂y φ_j,z - ∂z φ_j,y
+                    T(3, q, basis_j, 0) - T(1, q, basis_j, 2),  // ∂z φ_j,x - ∂x φ_j,z
+                    T(1, q, basis_j, 1) - T(2, q, basis_j, 0)}; // ∂x φ_j,y - ∂y φ_j,x
+                const std::array<double, 3> phi_j = {
+                    T(0, q, basis_j, 0),
+                    T(0, q, basis_j, 1),
+                    T(0, q, basis_j, 2)
+                };
+                for (int k = 0; k < 6; ++k)
+                {
+                    const int a = SYM[k][0];
+                    const int b = SYM[k][1];
+
+                    double val_curl = curl_i[a] * curl_j[b];
+                    double val_mass = phi_i[a] * phi_j[b];
+                    if (a != b){
+                        val_curl += curl_i[b] * curl_j[a];
+                        val_mass += phi_i[b] * phi_j[a];
+                    }
+
+                    K[k * ndofs * ndofs + basis_i * ndofs + basis_j] += w * val_curl;
+                    M[k * ndofs * ndofs + basis_i * ndofs + basis_j] += w * val_mass;
+                }
+            }
         }
-        const double w = wts[q];
     }
 
-    return std::vector<double>(ndofs * ndofs * 12, 0.0); // Placeholder for the actual reference matrix
+    std::vector<double> A;
+    A.reserve(K.size() + M.size());
+    A.insert(A.end(), K.begin(), K.end());  
+    A.insert(A.end(), M.begin(), M.end()); 
+
+    return A;
 }
 
 
 int main(int argc, char* argv[])
 {
     MPI_Init(&argc, &argv);
+    dolfinx::init_logging(argc, argv);
     {
         auto msh = std::make_shared<dolfinx::mesh::Mesh<double>>(
             dolfinx::mesh::create_box<double>(
@@ -275,7 +313,7 @@ int main(int argc, char* argv[])
         // std::cout << "Mesh: " << msh->topology()->index_map(tdim)->size_global() << " cells, "
                 //   << msh->topology()->index_map(0)->size_global() << " vertices" << std::endl;
 
-        std::vector<double> coeffs = piola_map(msh); // (n_cells, 12): 6 mass then 6 curl-curl
+        std::vector<double> coeffs = piola_map(msh); // (n_cells, 12): 6 curl-curl then 6 mass
         const std::size_t n_cells = coeffs.size() / 12;
         // std::cout << "coeffs shape: (" << n_cells << ", 12)\n";
         // std::cout << "cell 0 coeffs: ";
