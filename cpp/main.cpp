@@ -20,12 +20,13 @@
 
 // ---- Basix: reference-element data ------------------------------------------
 // (commented out to keep compiles fast -- uncomment each one when you first need it)
-// #include <basix/cell.h>             // basix::cell::type::tetrahedron
-// #include <basix/element-families.h> // element::family::N1E, lagrange_variant
-// #include <basix/finite-element.h>   // create_element, tabulate, T_apply, ...
+#include <basix/cell.h>             // basix::cell::type::tetrahedron
+#include <basix/element-families.h> // element::family::N1E, lagrange_variant
+#include <basix/finite-element.h>   // create_element, tabulate, T_apply, ...
 // #include <basix/interpolation.h>    // compute_interpolation_operator
 // #include <basix/mdspan.hpp>         // multi-dimensional views over flat arrays
-// #include <basix/quadrature.h>       // quadrature::make_quadrature
+#include <basix/polyset.h>          // polyset::type::standard (needed by make_quadrature)
+#include <basix/quadrature.h>       // quadrature::make_quadrature
 
 // ---- DOLFINx: mesh, dofmaps, boundary dofs, assembly ------------------------
 // #include <dolfinx/fem/DirichletBC.h>   // locate_dofs_topological, DirichletBC
@@ -68,6 +69,8 @@ std::ostream& operator<<(std::ostream& os, const std::vector<T>& vec) {
 //     | [6] [7] [8] |
 inline std::size_t id3(std::size_t c, int i, int j) { return 9 * c + 3 * i + j; }
 
+inline std::size_t id4(std::size_t c, int i, int j, int k) { return 27 * c + 9 * i + 3 * j + k; }
+
 // Determinant of one 3x3 row-major matrix (M points at its 9 entries).
 double determinant(const double* M)
 {
@@ -102,7 +105,7 @@ void print_mat3(const double* M)
 }
 
 
-void piola_map(auto msh){
+std::vector<double> piola_map(auto msh){
     auto x = msh->geometry().x(); // Coordinates of mesh verts x = [x0, y0, z0, x1, y1, z1, ...], shape (n_nodes, 3)
     auto v = msh->geometry().dofmaps().front(); // v(cell, k) = node index of vertex k of cell, shape (n_cells, 4)
     std::size_t n_cells = msh->topology()->index_map(3)->size_local();
@@ -176,7 +179,7 @@ void piola_map(auto msh){
     std::vector<double> coeffs(n_cells * 12, 0.0);
 
 
-    for (int c =0; c< n_cells; c++){
+    for (size_t c =0; c< n_cells; c++){
         // Six mass coefficients
         coeffs[12 * c + 0] = detj[c] * G[id3(c, 0, 0)]; // G00
         coeffs[12 * c + 1] = detj[c] * G[id3(c, 1, 1)]; // G11
@@ -193,6 +196,69 @@ void piola_map(auto msh){
         coeffs[12 * c + 10] = H[id3(c, 0, 2)] / detj[c]; // H02 = H20
         coeffs[12 * c + 11] = H[id3(c, 1, 2)] / detj[c]; // H12 = H21
     }
+    return coeffs;
+}
+
+std::vector<double> curlcurl_reference_matrix(const basix::FiniteElement<double>& element,
+                                              int quadrature_degree = 2)
+{
+    constexpr std::size_t tdim = 3;
+
+    auto [pts, wts] = basix::quadrature::make_quadrature<double>(
+        basix::quadrature::type::Default, element.cell_type(),
+        basix::polyset::type::standard, quadrature_degree);
+    const std::size_t nq = wts.size();
+
+    auto [tab, shape] = element.tabulate(1, pts, {nq, tdim});
+    const std::size_t ndofs = shape[2];
+    const std::size_t vs = shape[3]; // value size = 3 for N1E
+    
+    basix::impl::mdspan_t<const double, 4> T(tab.data(), shape);
+
+    // T (derivative, quadrature point, basis, value compnent)
+
+    // 
+    // Kᵢⱼ = Σ₍q₌₁₎ⁿᵠ wᵩ (∇ × φᵢ)(xᵩ) · (∇ × φⱼ)(xᵩ)
+    // 
+
+    double a = T(0, 0, 0 , 0);
+    double b = T(1, 0, 0 , 0);
+    double c = T(2, 0, 0 , 0);
+
+    std::cout << "T(0, 0, 0, 0) = " << a << ", T(1, 0, 0, 0) = " << b << ", T(2, 0, 0, 0) = " << c << "\n";
+
+
+    double phi_x = T(0, 0, 0, 0); // x component of basis funciton 0 at point 0
+    double phi_y = T(0, 0, 0, 1);
+    double phi_z = T(0, 0, 0, 2);
+    
+    std::vector<std::array<double, 3>> curls(nq * ndofs);
+
+    // T(0, q , 0, 2) gives you z component of basis funciton 0.
+    // std::cout << "phi_x = " << phi_x << ", phi_y = " << phi_y << ", phi_z = " << phi_z << "\n";
+    // q - quadrature point index, i - basis function index
+    
+    for (std::size_t q = 0; q < nq; ++q)
+    {
+        for (std::size_t basis_i = 0; basis_i < ndofs; ++basis_i)
+        {
+            // const double phi_x = T(0, q, i, 0); 
+            // const double phi_y = T(0, q, i, 1);
+            // const double phi_z = T(0, q, i, 2);
+
+            const double curl_x = T(2, q, basis_i, 2) - T(3, q, basis_i, 1); // ∂y φ_i,z - ∂z φ_i,y
+            const double curl_y = T(3, q, basis_i, 0) - T(1, q, basis_i, 2); // ∂z φ_i,x - ∂x φ_i,z
+            const double curl_z = T(1, q, basis_i, 1) - T(2, q, basis_i, 0); // ∂x φ_i,y - ∂y φ_i,x
+            // std::cout << "q=" << q << ", i=" << i
+            //         << ": phi_x=" << phi_x
+            //         << ", phi_y=" << phi_y
+            //         << ", phi_z=" << phi_z << "\n";
+            curls[q * ndofs + basis_i] = {{curl_x, curl_y, curl_z}};
+        }
+        const double w = wts[q];
+    }
+
+    return std::vector<double>(ndofs * ndofs * 12, 0.0); // Placeholder for the actual reference matrix
 }
 
 
@@ -209,7 +275,21 @@ int main(int argc, char* argv[])
         // std::cout << "Mesh: " << msh->topology()->index_map(tdim)->size_global() << " cells, "
                 //   << msh->topology()->index_map(0)->size_global() << " vertices" << std::endl;
 
-        piola_map(msh);
+        std::vector<double> coeffs = piola_map(msh); // (n_cells, 12): 6 mass then 6 curl-curl
+        const std::size_t n_cells = coeffs.size() / 12;
+        // std::cout << "coeffs shape: (" << n_cells << ", 12)\n";
+        // std::cout << "cell 0 coeffs: ";
+        for (int k = 0; k < 12; ++k) std::cout << coeffs[k] << " ";
+        std::cout << "\n";
+
+        const int degree = 3;
+        auto element = basix::create_element<double>(
+            basix::element::family::N1E, basix::cell::type::tetrahedron, degree,
+            basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
+        std::vector<double> refs = curlcurl_reference_matrix(element, 2 * degree + 2);
+        const std::size_t nd = element.dim();
+        // std::cout << "refs shape: (12, " << nd << ", " << nd << ")\n";
+        // std::cout << "R[0, 0, 0] = " << refs[0] << ", R[6, 0, 0] = " << refs[6 * nd * nd] << "\n";
     }
     MPI_Finalize();
     return 0;
