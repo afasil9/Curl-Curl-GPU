@@ -24,6 +24,8 @@
 #include <dolfinx/fem/FiniteElement.h> // wraps the Basix element for DOLFINx
 #include <dolfinx/fem/FunctionSpace.h> // FunctionSpace, dofmap
 #include <dolfinx/fem/functionspace_factory.h> // create_functionspace
+#include <dolfinx/fem/DirichletBC.h>   // locate_dofs_topological (boundary dofs)
+#include <dolfinx/mesh/utils.h>        // exterior_facet_indices
 #include <dolfinx/mesh/Mesh.h>
 #include <dolfinx/mesh/generation.h> // create_box (unit cube of tets)
 
@@ -417,6 +419,27 @@ std::vector<double> getdiagonal(const std::vector<double>& coeffs, const permuta
     return diagonal;
 }
 
+// Boundary mask: bc_mask[g] = 1.0 if global dof g lies on the boundary, else 0.0.
+std::vector<double> boundary_dof_mask(auto msh, auto V, std::int32_t ndofs)
+{
+    const int tdim = msh->topology()->dim();
+    auto topology = msh->topology_mutable();
+    topology->create_entities(tdim - 1);          // facets
+    topology->create_connectivity(tdim - 1, tdim); // facet -> cell (to find exterior facets)
+    topology->create_connectivity(tdim, tdim - 1); // cell -> facet (to find dofs on facets)
+
+    const std::vector<std::int32_t> facets = dolfinx::mesh::exterior_facet_indices(*topology);
+    const std::vector<std::int32_t> bdofs = dolfinx::fem::locate_dofs_topological(
+        *topology, *V->dofmap(), tdim - 1, std::span<const std::int32_t>(facets));
+
+    std::vector<double> bc_mask(ndofs, 0.0);
+    // Mark the boundary dofs as 1.0 in mask. bc_mask[g] = 1.0 if dof g lies on a boundary edge or face
+    for (std::int32_t g : bdofs)
+        if (g < ndofs)
+            bc_mask[g] = 1.0;
+    return bc_mask;
+}
+
 
 int main(int argc, char* argv[])
 {
@@ -466,6 +489,8 @@ int main(int argc, char* argv[])
         std::vector<double> y_vec = matvec(x, coeffs, pc, nd, folded, dofmap);
 
         std::vector<double> diag = getdiagonal(coeffs, pc, nd, folded, dofmap, ndofs);
+        
+
 
 
         // std::cout << "refs shape: (12, " << nd << ", " << nd << ")\n";
