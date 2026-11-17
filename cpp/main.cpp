@@ -376,7 +376,6 @@ std::vector<double> fold_reference(const std::vector<double>& refs,
 }
 
 
-
 std::vector<double> matvec(const std::vector<double>& x, const std::vector<double>& coeffs, const permutation_class& pc, int nd, const std::vector<double>& folded, auto dofmap)
 {
 
@@ -400,6 +399,23 @@ std::vector<double> matvec(const std::vector<double>& x, const std::vector<doubl
     }
 
 
+std::vector<double> getdiagonal(const std::vector<double>& coeffs, const permutation_class& pc, int nd, const std::vector<double>& folded, auto dofmap, int ndofs)
+{
+    const std::size_t n_cells = pc.clas.size();
+    std::vector<double> diagonal(ndofs, 0.0);
+
+    for (std::size_t c = 0; c < n_cells; ++c){
+        int p = pc.clas[c]; // permutation class of cell c
+        for (int k = 0; k < 12; ++k){ // Loop over 6 curl then 6 mass
+            for (int i = 0; i < nd; ++i){ // Test basis functions
+                double sum = 0.0;
+                sum += folded[((p * 12 + k) * nd + i) * nd + i];
+                diagonal[dofmap(c, i)] += coeffs[12 * c + k] * sum;
+            }
+        }
+    }
+    return diagonal;
+}
 
 
 int main(int argc, char* argv[])
@@ -447,9 +463,9 @@ int main(int argc, char* argv[])
 
         std::vector<double> x(ndofs, 1.0);   // test input: all ones for now
 
+        std::vector<double> y_vec = matvec(x, coeffs, pc, nd, folded, dofmap);
 
-        std::vector<double> y_vec(x.size(), 0.0);
-        y_vec = matvec(x, coeffs, pc, nd, folded, dofmap);
+        std::vector<double> diag = getdiagonal(coeffs, pc, nd, folded, dofmap, ndofs);
 
 
         // std::cout << "refs shape: (12, " << nd << ", " << nd << ")\n";
