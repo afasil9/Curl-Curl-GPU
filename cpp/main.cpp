@@ -441,6 +441,27 @@ std::vector<double> boundary_dof_mask(auto msh, auto V, std::int32_t ndofs)
 }
 
 
+std::vector<double> matvec_bc(const std::vector<double>& x,
+                              const std::vector<double>& bc_mask,
+                              const std::vector<double>& coeffs,
+                              const permutation_class& pc, int nd,
+                              const std::vector<double>& folded, auto dofmap)
+{
+    std::vector<double> x_in = x;
+
+    for (std::size_t g = 0; g < x.size(); ++g)
+    if (bc_mask[g] == 1.0)
+        x_in[g] = 0.0; // Zero out the boundary dofs in the input vector
+    std::vector<double> y = matvec(x_in, coeffs, pc, nd, folded, dofmap);
+
+    for (std::size_t g = 0; g < y.size(); ++g)
+        if (bc_mask[g] == 1.0)
+        y[g] = x[g];
+
+    return y;
+}
+
+
 int main(int argc, char* argv[])
 {
     MPI_Init(&argc, &argv);
