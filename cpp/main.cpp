@@ -15,6 +15,7 @@
 #include <basix/cell.h>             // basix::cell::type::tetrahedron
 #include <basix/element-families.h> // element::family::N1E, lagrange_variant
 #include <basix/finite-element.h>   // create_element, tabulate, T_apply, ...
+#include <basix/interpolation.h>    // compute_interpolation_operator (transfer operators)
 #include <basix/mdspan.hpp>         // basix::impl::mdspan_t (view over the tabulation)
 #include <basix/polyset.h>          // polyset::type::standard (needed by make_quadrature)
 #include <basix/quadrature.h>       // quadrature::make_quadrature
@@ -326,8 +327,37 @@ std::vector<double> dense_transform(const basix::FiniteElement<double>& element,
             element.Tt_apply(block, nd, uniq[p]);
         else
             element.T_apply(block, nd, uniq[p]);
-    }    
+    }
     return out;
+}
+
+std::vector<double> dense_transform_inv(const basix::FiniteElement<double>& element,
+                                        const std::vector<std::uint32_t>& uniq)
+{
+    int nd = element.dim();
+    int n_class = uniq.size();
+
+    std::vector<double> out(n_class * nd * nd, 0.0);
+
+    for (int p = 0; p < n_class; ++p){
+        for (int i = 0 ; i< nd; ++i){
+            out[p * nd * nd +  i * nd + i] = 1.0;
+        }
+        std::span<double> block(out.data() + p * nd * nd, nd * nd);
+
+        element.Tt_inv_apply(block, nd, uniq[p]);
+    }
+    return out;
+}
+
+// Reference-cell interpolation matrix from element_from to element_to.
+// Shape (nd_to, nd_from), row-major: B_ref[i * nd_from + j].
+// Same as basix.compute_interpolation_operator in basic_ops.py.
+std::vector<double> reference_interpolation(const basix::FiniteElement<double>& element_from,
+                                            const basix::FiniteElement<double>& element_to)
+{
+    auto [B_ref, shape] = basix::compute_interpolation_operator(element_from, element_to);
+    return B_ref;
 }
 
 
@@ -477,6 +507,48 @@ std::vector<double> diagonal_bc(const std::vector<double>& bc_mask,
 }
 
 
+std::vector<double> fold_interpolation(const std::vector<double>& interp_ref, const std::vector<double>& Ts, const std::vector<double>& Td, int n_class, int nd_low, int nd_high)
+{
+    // interp_ref: (high, low) for each permutation class
+
+    // folded[p][i][j] = folded[((p * nd_high + i) * nd_low + j)]
+    std::vector<double> folded(n_class * nd_high * nd_low, 0.0);
+
+    for (int p = 0; p < n_class; ++p)
+    {
+        // tmp = Td_p · B_ref
+        std::vector<double> tmp(nd_high * nd_low, 0.0);
+        for (int rows_td = 0; rows_td < nd_high; ++rows_td)
+        {
+            for (int cols_br = 0; cols_br < nd_low; ++cols_br)
+            {
+                for (int m = 0; m < nd_high; ++m)
+                {
+                    tmp[rows_td * nd_low + cols_br] += Td[p * nd_high * nd_high + rows_td * nd_high + m] *
+                                                       interp_ref[m * nd_low + cols_br];
+                }
+            }
+        }
+
+        // folded[p] = tmp · Ts_p
+        for (int rows_tmp = 0; rows_tmp < nd_high; ++rows_tmp)
+        {
+            for (int cols_ts = 0; cols_ts < nd_low; ++cols_ts)
+            {
+                for (int m = 0; m < nd_low; ++m)
+                {
+                    folded[(p * nd_high + rows_tmp) * nd_low + cols_ts] +=
+                        tmp[rows_tmp * nd_low + m] * Ts[p * nd_low * nd_low + m * nd_low + cols_ts];
+                }
+            }
+        }
+    }
+    return folded;
+}
+
+
+
+
 int main(int argc, char* argv[])
 {
     MPI_Init(&argc, &argv);
@@ -525,7 +597,27 @@ int main(int argc, char* argv[])
         std::vector<double> y_vec = matvec(x, coeffs, pc, nd, folded, dofmap);
 
         std::vector<double> diag = getdiagonal(coeffs, pc, nd, folded, dofmap, ndofs);
+
+        // ---- Transfer operator: degree 1 -> degree 2 (step A setup) ----
+        auto e_low = basix::create_element<double>(
+            basix::element::family::N1E, basix::cell::type::tetrahedron, 1,
+            basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
+        auto e_high = basix::create_element<double>(
+            basix::element::family::N1E, basix::cell::type::tetrahedron, 2,
+            basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
+        const int nd_low  = e_low.dim();   // 6
+        const int nd_high = e_high.dim();  // 20
+
+        // Reference transfer matrix, shape (nd_high, nd_low)
+        std::vector<double> B_ref = reference_interpolation(e_low, e_high);
+
+        // Per-class transforms: Tt for the source (low), Tt_inv for the destination (high)
+        std::vector<double> Ts = dense_transform(e_low,  pc.uniq, true);          // (n_class, nd_low,  nd_low)
+        std::vector<double> Td = dense_transform_inv(e_high, pc.uniq);       // (n_class, nd_high, nd_high)
+        std::cout << "interpolation_ref: " << nd_high << " x " << nd_low << "\n";
         
+        std::vector<double> B_folded = fold_interpolation(B_ref, Ts, Td, pc.uniq.size(), nd_low, nd_high);
+
 
 
 
