@@ -1,50 +1,28 @@
 // ---- Standard library -------------------------------------------------------
-#include <algorithm> // std::sort, std::unique (permutation_classes)
-#include <array>
-#include <cmath>
-#include <cstdint> // std::int32_t, std::uint32_t (dofmaps, permutation codes)
-#include <cstdio>  // printf
-#include <iostream>
-#include <memory> // std::shared_ptr (mesh, function spaces)
-// #include <numeric>
-// #include <random> // random start vector for the power iteration
-#include <span>
+#include <algorithm> // std::sort, std::unique, std::lower_bound (permutation_classes)
+#include <array>     // std::array (curls, basis values, edge vectors)
+#include <cmath>     // std::abs (piola_map)
+#include <cstdint>   // std::int32_t, std::uint32_t (class indices, permutation codes)
+#include <iostream>  // std::cout
+#include <memory>    // std::make_shared (mesh)
+#include <span>      // std::span (dense_transform)
 #include <vector>
 
 // ---- MPI --------------------------------------------------------------------
 #include <mpi.h>
 
 // ---- Basix: reference-element data ------------------------------------------
-// (commented out to keep compiles fast -- uncomment each one when you first need it)
 #include <basix/cell.h>             // basix::cell::type::tetrahedron
 #include <basix/element-families.h> // element::family::N1E, lagrange_variant
 #include <basix/finite-element.h>   // create_element, tabulate, T_apply, ...
-// #include <basix/interpolation.h>    // compute_interpolation_operator
-// #include <basix/mdspan.hpp>         // multi-dimensional views over flat arrays
+#include <basix/mdspan.hpp>         // basix::impl::mdspan_t (view over the tabulation)
 #include <basix/polyset.h>          // polyset::type::standard (needed by make_quadrature)
 #include <basix/quadrature.h>       // quadrature::make_quadrature
 
-// ---- DOLFINx: mesh, dofmaps, boundary dofs, assembly ------------------------
-// #include <dolfinx/fem/DirichletBC.h>   // locate_dofs_topological, DirichletBC
-// #include <dolfinx/fem/DofMap.h>        // cell -> dof map, index_map
-// #include <dolfinx/fem/FiniteElement.h> // T_apply / Tt_apply / Tt_inv_apply
-// #include <dolfinx/fem/Function.h>
-// #include <dolfinx/fem/FunctionSpace.h>
-// #include <dolfinx/fem/assembler.h> // assemble_vector, assemble_matrix
-// #include <dolfinx/fem/utils.h>     // create_functionspace, create_form
-// #include <dolfinx/la/MatrixCSR.h>  // coarse (degree 1) matrix
-// #include <dolfinx/la/SparsityPattern.h>
-// #include <dolfinx/la/Vector.h>
-#include <dolfinx/common/log.h>   // init_logging (required before any dolfinx call)
+// ---- DOLFINx: mesh ----------------------------------------------------------
+#include <dolfinx/common/log.h>      // init_logging (required before any dolfinx call)
 #include <dolfinx/mesh/Mesh.h>
 #include <dolfinx/mesh/generation.h> // create_box (unit cube of tets)
-// #include <dolfinx/mesh/utils.h>      // exterior_facet_indices
-
-// ---- FFCx-generated forms (from forms.py, via `ffcx forms.py`) --------------
-// #include "forms.h"      // TODO: enable once forms.py exists and ffcx has been run
-
-// ---- Our CUDA kernels (implemented in kernels.cu) ---------------------------
-// #include "kernels.hpp"  // TODO: enable once kernels.hpp / kernels.cu exist
 
 template <typename T>
 std::ostream& operator<<(std::ostream& os, const std::vector<T>& vec) {
@@ -324,6 +302,80 @@ permutation_class permutation_classes(auto msh)
     return {clas, uniq};
 }
 
+std::vector<double> dense_transform(const basix::FiniteElement<double>& element,
+                                    const std::vector<std::uint32_t>& uniq,
+                                    bool transpose)
+{
+    int nd = element.dim();
+    int n_class = uniq.size();
+
+    std::vector<double> out(n_class * nd * nd, 0.0);
+
+    for (int p = 0; p < n_class; ++p){
+        for (int i = 0 ; i< nd; ++i){
+            out[p * nd * nd +  i * nd + i] = 1.0;
+        }
+        std::span<double> block(out.data() + p * nd * nd, nd * nd);
+
+        if (transpose)
+            element.Tt_apply(block, nd, uniq[p]);
+        else
+            element.T_apply(block, nd, uniq[p]);
+    }    
+    return out;
+}
+
+
+std::vector<double> fold_reference(const std::vector<double>& refs,
+                                   const std::vector<double>& T,
+                                   const std::vector<double>& Tt,
+                                   int n_class, int nd)
+{
+
+    // folded[p][k][i][j]  =  folded[((p * 12 + k) * nd + i) * nd + j]
+    // p perm class, k = 0..5 for curl-curl then 6..11 for mass, i = Test basis functions, j = Trial basis functions
+    std::vector<double> folded(n_class * 12 * nd * nd, 0.0); // result: (n_class, 12, nd, nd)
+    std::vector<double> tmp(nd * nd, 0.0);                        // scratch: one nd x nd matrix
+
+
+
+    for (int k = 0; k < 12; ++k){ // Loop over 6 curl then 6 mass
+        for (int p = 0; p < n_class; ++p){
+            // tmp = T_p · R[k]
+            std::fill(tmp.begin(), tmp.end(), 0.0);
+            for (int rows_tp = 0; rows_tp < nd; ++rows_tp){
+                for (int cols_rk = 0; cols_rk < nd; ++cols_rk){
+                    for (int m = 0; m < nd; ++m){
+                        // Tp [i][m] = T[p * nd * nd + i * nd + m]
+                        // Rk [m][j] = refs[k * nd * nd + m * nd + j]
+                        // tmp[i][j] = Σₘ Tp[i][m] * Rk[m][j]
+                        tmp[rows_tp * nd + cols_rk] += T[p * nd * nd + rows_tp * nd + m] *
+                                                       refs[k * nd * nd + m * nd + cols_rk];
+                    }
+                }
+            }
+
+            // folded[p][k] = tmp · Tt_p  (same p and k, while tmp still holds T_p · R[k])
+            for (int rows_tp = 0; rows_tp < nd; ++rows_tp){
+                for (int cols_rk = 0; cols_rk < nd; ++cols_rk){
+                    for (int m = 0; m < nd; ++m){
+                        // tmp [i][m] = tmp[i * nd + m]
+                        // Tt [m][j] = Tt[p * nd * nd + m * nd + j]
+                        // folded[p][k][i][j] = Σₘ tmp[i][m] * Tt[m][j]
+                        folded[((p * 12 + k) * nd + rows_tp) * nd + cols_rk] +=
+                            tmp[rows_tp * nd + m] * Tt[p * nd * nd + m * nd + cols_rk];
+                    }
+                }
+            }
+        }
+    }
+    return folded;
+}
+
+
+
+
+
 
 int main(int argc, char* argv[])
 {
@@ -355,6 +407,13 @@ int main(int argc, char* argv[])
 
         permutation_class pc = permutation_classes(msh);
         std::cout << "permutation classes: " << pc.uniq.size() << "\n";
+
+        std::vector<double> Tdense = dense_transform(element, pc.uniq, false);
+        std::vector<double> Ttdense = dense_transform(element, pc.uniq, true);
+
+        std::vector<double> folded = fold_reference(refs, Tdense, Ttdense, pc.uniq.size(), nd);
+
+
         // std::cout << "refs shape: (12, " << nd << ", " << nd << ")\n";
         // std::cout << "R[0, 0, 0] = " << refs[0] << ", R[6, 0, 0] = " << refs[6 * nd * nd] << "\n";
     }
