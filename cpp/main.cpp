@@ -19,8 +19,11 @@
 #include <basix/polyset.h>          // polyset::type::standard (needed by make_quadrature)
 #include <basix/quadrature.h>       // quadrature::make_quadrature
 
-// ---- DOLFINx: mesh ----------------------------------------------------------
+// ---- DOLFINx: mesh, function space, dofmap ----------------------------------
 #include <dolfinx/common/log.h>      // init_logging (required before any dolfinx call)
+#include <dolfinx/fem/FiniteElement.h> // wraps the Basix element for DOLFINx
+#include <dolfinx/fem/FunctionSpace.h> // FunctionSpace, dofmap
+#include <dolfinx/fem/functionspace_factory.h> // create_functionspace
 #include <dolfinx/mesh/Mesh.h>
 #include <dolfinx/mesh/generation.h> // create_box (unit cube of tets)
 
@@ -374,6 +377,28 @@ std::vector<double> fold_reference(const std::vector<double>& refs,
 
 
 
+std::vector<double> matvec(const std::vector<double>& x, const std::vector<double>& coeffs, const permutation_class& pc, int nd, const std::vector<double>& folded, auto dofmap)
+{
+
+    //dofmap = (n_cells, nd)
+    const std::size_t n_cells = pc.clas.size();
+    std::vector<double> y_vec(x.size(), 0.0);
+
+    for (std::size_t c = 0; c < n_cells; ++c){
+        int p = pc.clas[c]; // permutation class of cell c
+        for (int k = 0; k < 12; ++k){ // Loop over 6 curl then 6 mass
+            for (int i = 0; i < nd; ++i){ // Test basis functions
+                double sum = 0.0;
+                for (int j = 0; j < nd; ++j){ // Trial basis functions
+                    sum += folded[((p * 12 + k) * nd + i) * nd + j] * x[(dofmap(c, j))];
+                }
+                y_vec[dofmap(c, i)] += coeffs[12 * c + k] * sum;
+            }
+        }
+    }
+    return y_vec;
+    }
+
 
 
 
@@ -412,6 +437,19 @@ int main(int argc, char* argv[])
         std::vector<double> Ttdense = dense_transform(element, pc.uniq, true);
 
         std::vector<double> folded = fold_reference(refs, Tdense, Ttdense, pc.uniq.size(), nd);
+
+
+        auto fe = std::make_shared<const dolfinx::fem::FiniteElement<double>>(element, 3);
+        auto V  = std::make_shared<dolfinx::fem::FunctionSpace<double>>(
+                    dolfinx::fem::create_functionspace<double>(msh, fe));
+        auto dofmap = V->dofmap()->map();
+        const std::int32_t ndofs = V->dofmap()->index_map->size_local();
+
+        std::vector<double> x(ndofs, 1.0);   // test input: all ones for now
+
+
+        std::vector<double> y_vec(x.size(), 0.0);
+        y_vec = matvec(x, coeffs, pc, nd, folded, dofmap);
 
 
         // std::cout << "refs shape: (12, " << nd << ", " << nd << ")\n";
