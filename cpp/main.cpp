@@ -351,13 +351,13 @@ std::vector<double> dense_transform_inv(const basix::FiniteElement<double>& elem
 }
 
 // Reference-cell interpolation matrix from element_from to element_to.
-// Shape (nd_to, nd_from), row-major: B_ref[i * nd_from + j].
+// Shape (nd_to, nd_from), row-major: interp_ref[i * nd_from + j].
 // Same as basix.compute_interpolation_operator in basic_ops.py.
 std::vector<double> reference_interpolation(const basix::FiniteElement<double>& element_from,
                                             const basix::FiniteElement<double>& element_to)
 {
-    auto [B_ref, shape] = basix::compute_interpolation_operator(element_from, element_to);
-    return B_ref;
+    auto [interp_ref, shape] = basix::compute_interpolation_operator(element_from, element_to);
+    return interp_ref;
 }
 
 
@@ -516,7 +516,7 @@ std::vector<double> fold_interpolation(const std::vector<double>& interp_ref, co
 
     for (int p = 0; p < n_class; ++p)
     {
-        // tmp = Td_p · B_ref
+        // tmp = Td_p · interp_ref
         std::vector<double> tmp(nd_high * nd_low, 0.0);
         for (int rows_td = 0; rows_td < nd_high; ++rows_td)
         {
@@ -544,6 +544,77 @@ std::vector<double> fold_interpolation(const std::vector<double>& interp_ref, co
         }
     }
     return folded;
+}
+
+
+std::vector<double> apply_transfer(const std::vector<double>& x_low, const std::vector<double>& interp_folded, const permutation_class& pc, int nd_low, int nd_high, auto dofmap_low, auto dofmap_high, std::int32_t ndofs_high)
+{
+    const std::size_t n_cells = pc.clas.size();
+    std::vector<double> x_high(ndofs_high, 0.0);
+    std::vector<double> mult(ndofs_high, 0.0); // how many cells contain each high-order dof
+
+    for (std::size_t c = 0; c < n_cells; ++c)
+    {
+        int p = pc.clas[c]; // permutation class of cell c
+        for (int i = 0; i < nd_high; ++i) // Test basis functions in high-order space
+        {
+            double sum = 0.0;
+            for (int j = 0; j < nd_low; ++j) // Trial basis functions in low-order space
+            {
+                sum += interp_folded[(p * nd_high + i) * nd_low + j] * x_low[dofmap_low(c, j)];
+            }
+            const std::int32_t g = dofmap_high(c, i);
+            if (g < ndofs_high) // skip ghost dofs (none in serial)
+            {
+                x_high[g] += sum;
+                mult[g] += 1.0;
+            }
+        }
+    }
+
+    // Average: every cell gave the same value, so dividing by the count recovers it
+    for (std::int32_t g = 0; g < ndofs_high; ++g)
+        x_high[g] /= mult[g];
+
+    return x_high;
+}
+
+// Transpoing the x vector 
+std::vector<double> apply_transfer_transpose(const std::vector<double>& x_high, const std::vector<double>& interp_folded, const permutation_class& pc, int nd_low, int nd_high, auto dofmap_low, auto dofmap_high, std::int32_t ndofs_low)
+{
+    const std::size_t n_cells = pc.clas.size();
+    const std::int32_t ndofs_high = x_high.size();
+
+    std::vector<double> mult(ndofs_high, 0.0);
+    for (std::size_t c = 0; c < n_cells; ++c)
+        for (int i = 0; i < nd_high; ++i)
+        {
+            const std::int32_t g = dofmap_high(c, i);
+            if (g < ndofs_high)
+                mult[g] += 1.0;
+        }
+
+    std::vector<double> x_scaled(ndofs_high);
+    for (std::int32_t g = 0; g < ndofs_high; ++g)
+        x_scaled[g] = x_high[g] / mult[g];
+
+    std::vector<double> x_low(ndofs_low, 0.0);
+    for (std::size_t c = 0; c < n_cells; ++c)
+    {
+        int p = pc.clas[c]; // permutation class of cell c
+        for (int j = 0; j < nd_low; ++j) // Low-order dof (output)
+        {
+            double sum = 0.0;
+            for (int i = 0; i < nd_high; ++i) // High-order dof (input): column j of interp_folded
+            {
+                const std::int32_t g = dofmap_high(c, i);
+                if (g < ndofs_high)
+                    sum += interp_folded[(p * nd_high + i) * nd_low + j] * x_scaled[g];
+            }
+            x_low[dofmap_low(c, j)] += sum;
+        }
+    }
+    return x_low;
 }
 
 
@@ -609,16 +680,41 @@ int main(int argc, char* argv[])
         const int nd_high = e_high.dim();  // 20
 
         // Reference transfer matrix, shape (nd_high, nd_low)
-        std::vector<double> B_ref = reference_interpolation(e_low, e_high);
+        std::vector<double> interp_ref = reference_interpolation(e_low, e_high);
 
         // Per-class transforms: Tt for the source (low), Tt_inv for the destination (high)
         std::vector<double> Ts = dense_transform(e_low,  pc.uniq, true);          // (n_class, nd_low,  nd_low)
         std::vector<double> Td = dense_transform_inv(e_high, pc.uniq);       // (n_class, nd_high, nd_high)
         std::cout << "interpolation_ref: " << nd_high << " x " << nd_low << "\n";
         
-        std::vector<double> B_folded = fold_interpolation(B_ref, Ts, Td, pc.uniq.size(), nd_low, nd_high);
+        std::vector<double> interp_folded = fold_interpolation(interp_ref, Ts, Td, pc.uniq.size(), nd_low, nd_high);
 
+        // Function spaces for the two degrees, to get their dofmaps
+        auto fe_low  = std::make_shared<const dolfinx::fem::FiniteElement<double>>(e_low, 3);
+        auto fe_high = std::make_shared<const dolfinx::fem::FiniteElement<double>>(e_high, 3);
+        auto V_low   = std::make_shared<dolfinx::fem::FunctionSpace<double>>(
+                           dolfinx::fem::create_functionspace<double>(msh, fe_low));
+        auto V_high  = std::make_shared<dolfinx::fem::FunctionSpace<double>>(
+                           dolfinx::fem::create_functionspace<double>(msh, fe_high));
 
+        auto dofmap_low  = V_low->dofmap()->map();   // (n_cells, 6)
+        auto dofmap_high = V_high->dofmap()->map();  // (n_cells, 20)
+        const std::int32_t ndofs_low  = V_low->dofmap()->index_map->size_local();
+        const std::int32_t ndofs_high = V_high->dofmap()->index_map->size_local();
+
+        // Test: transfer a low-order vector up to the high-order space
+        std::vector<double> x_low(ndofs_low);
+        for (std::int32_t g = 0; g < ndofs_low; ++g) x_low[g] = std::sin(g);
+        std::vector<double> x_high = apply_transfer(x_low, interp_folded, pc, nd_low, nd_high,
+                                                    dofmap_low, dofmap_high, ndofs_high);
+        std::cout << "transfer: " << ndofs_low << " low dofs -> " << ndofs_high << " high dofs\n";
+
+        // Test: restrict a high-order vector down to the low-order space
+        std::vector<double> r_high(ndofs_high);
+        for (std::int32_t g = 0; g < ndofs_high; ++g) r_high[g] = std::cos(g);
+        std::vector<double> r_low = apply_transfer_transpose(r_high, interp_folded, pc, nd_low, nd_high,
+                                                             dofmap_low, dofmap_high, ndofs_low);
+        std::cout << "restriction: " << ndofs_high << " high dofs -> " << ndofs_low << " low dofs\n";
 
 
         // std::cout << "refs shape: (12, " << nd << ", " << nd << ")\n";
