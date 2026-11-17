@@ -461,6 +461,21 @@ std::vector<double> matvec_bc(const std::vector<double>& x,
     return y;
 }
 
+std::vector<double> diagonal_bc(const std::vector<double>& bc_mask,
+                                const std::vector<double>& coeffs,
+                                const permutation_class& pc, int nd,
+                                const std::vector<double>& folded, auto dofmap, int ndofs)
+{
+    std::vector<double> d = getdiagonal(coeffs, pc, nd, folded, dofmap, ndofs);
+
+    for (std::size_t g = 0; g < d.size(); ++g)
+    {
+        if (bc_mask[g] == 1.0)
+            d[g] = 1.0; // boundary row is all zeros except a 1 on the diagonal
+    }
+    return d;
+}
+
 
 int main(int argc, char* argv[])
 {
