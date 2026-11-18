@@ -617,6 +617,31 @@ std::vector<double> apply_transfer_transpose(const std::vector<double>& x_high, 
     return x_low;
 }
 
+std::vector<double> discrete_gradient_reference(const basix::FiniteElement<double>& element_h1,
+                                                const basix::FiniteElement<double>& element_curl)
+{
+    //Get Nedelec points and tabulate H1 basis functions at those points
+    const auto [pts, pts_shape] = element_curl.points();
+    const std::size_t nq = pts_shape[0];
+
+    // Get 1st Derivative of basis functions, i.e. gradient. tabh1 is derivative or H1.
+    auto [tab, tab_shape] = element_h1.tabulate(1, pts, pts_shape);
+    basix::impl::mdspan_t<const double, 4> tab_h1(tab.data(), tab_shape);
+    const std::size_t n_h1 = tab_shape[2];
+
+    const auto [M, M_shape] = element_curl.interpolation_matrix();
+    const std::size_t n_curl = M_shape[0];
+
+    std::vector<double> G_ref(n_curl * n_h1, 0.0);
+    for (std::size_t i = 0; i < n_curl; ++i)          
+        for (std::size_t j = 0; j < n_h1; ++j)        
+            for (std::size_t d = 0; d < 3; ++d)       
+                for (std::size_t q = 0; q < nq; ++q)  
+                    G_ref[i * n_h1 + j] += M[i * M_shape[1] + d * nq + q] * tab_h1(1 + d, q, j, 0);
+
+    return G_ref;
+}
+
 
 
 
@@ -716,6 +741,37 @@ int main(int argc, char* argv[])
                                                              dofmap_low, dofmap_high, ndofs_low);
         std::cout << "restriction: " << ndofs_high << " high dofs -> " << ndofs_low << " low dofs\n";
 
+        auto element_h1 = basix::create_element<double>(
+            basix::element::family::P, basix::cell::type::tetrahedron, degree,
+            basix::element::lagrange_variant::gll_warped, basix::element::dpc_variant::unset, false);
+        const int nd_h1 = element_h1.dim(); // 20
+
+        // Reference gradient matrix, shape (nd, nd_h1) = (45, 20)
+        std::vector<double> grad_ref = discrete_gradient_reference(element_h1, element);
+
+        std::vector<double> Ts_h1(pc.uniq.size() * nd_h1 * nd_h1, 0.0);
+        for (std::size_t p = 0; p < pc.uniq.size(); ++p)
+            for (int i = 0; i < nd_h1; ++i)
+                Ts_h1[p * nd_h1 * nd_h1 + i * nd_h1 + i] = 1.0;
+        std::vector<double> Td_curl = dense_transform_inv(element, pc.uniq);
+
+        // Folding has the same form as the transfer (Td · G_ref · Ts), so reuse fold_interpolation
+        std::vector<double> grad_folded = fold_interpolation(grad_ref, Ts_h1, Td_curl, pc.uniq.size(), nd_h1, nd);
+
+        // Lagrange function space for the source dofmap
+        auto fe_h1 = std::make_shared<const dolfinx::fem::FiniteElement<double>>(element_h1, 3);
+        auto V_h1  = std::make_shared<dolfinx::fem::FunctionSpace<double>>(
+                         dolfinx::fem::create_functionspace<double>(msh, fe_h1));
+        auto dofmap_h1 = V_h1->dofmap()->map();
+        const std::int32_t ndofs_h1 = V_h1->dofmap()->index_map->size_local();
+
+        // Applying it is also the same as the transfer: shared Nédélec dofs get the same value from
+        // every cell, so apply_transfer's averaging gives the right answer
+        std::vector<double> u_h1(ndofs_h1);
+        for (std::int32_t g = 0; g < ndofs_h1; ++g) u_h1[g] = std::sin(g);
+        std::vector<double> grad_u = apply_transfer(u_h1, grad_folded, pc, nd_h1, nd,
+                                                    dofmap_h1, dofmap, ndofs);
+        std::cout << "discrete gradient: " << ndofs_h1 << " H1 dofs -> " << ndofs << " H(curl) dofs\n";
 
         // std::cout << "refs shape: (12, " << nd << ", " << nd << ")\n";
         // std::cout << "R[0, 0, 0] = " << refs[0] << ", R[6, 0, 0] = " << refs[6 * nd * nd] << "\n";
