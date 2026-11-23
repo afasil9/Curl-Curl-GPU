@@ -643,6 +643,43 @@ std::vector<double> discrete_gradient_reference(const basix::FiniteElement<doubl
 }
 
 
+struct level{
+    std::shared_ptr<dolfinx::fem::FunctionSpace<double>> V;
+    int elem_dim;
+    std::int32_t ndofs;
+    std::vector<double> folded;
+    dolfinx::md::mdspan<const std::int32_t,
+                        dolfinx::md::dextents<std::size_t, 2>> dofmap;
+    std::vector<double> bc_mask;
+};
+
+level build_level(auto msh, const permutation_class& pc, int degree)
+{
+    level L;
+
+    auto element = basix::create_element<double>(
+        basix::element::family::N1E, basix::cell::type::tetrahedron, degree,
+        basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
+    
+    L.elem_dim = element.dim();
+    
+    std::vector<double> refs = curlcurl_reference_matrix(element, 2 * degree + 2);
+    std::vector<double> Tdense = dense_transform(element, pc.uniq, false);
+    std::vector<double> Ttdense = dense_transform(element, pc.uniq, true);
+    std::vector<double> folded = fold_reference(refs, Tdense, Ttdense, pc.uniq.size(), L.elem_dim );
+
+    auto fe = std::make_shared<const dolfinx::fem::FiniteElement<double>>(element, msh->geometry().dim());
+    
+    L.folded = folded;
+    L.V = std::make_shared<dolfinx::fem::FunctionSpace<double>>(dolfinx::fem::create_functionspace<double>(msh, fe));
+    L.dofmap = L.V->dofmap()->map();
+    L.ndofs = L.V->dofmap()->index_map->size_local();
+    L.bc_mask = boundary_dof_mask(msh, L.V, L.ndofs);
+
+
+    return L;
+}
+
 
 
 int main(int argc, char* argv[])
@@ -655,126 +692,96 @@ int main(int argc, char* argv[])
                 MPI_COMM_WORLD, {{{0.0, 0.0, 0.0}, {1.0, 1.0, 1.0}}}, {4, 4, 4},
                 dolfinx::mesh::CellType::tetrahedron));
 
-        const int tdim = msh->topology()->dim();
-        // std::cout << "Mesh: " << msh->topology()->index_map(tdim)->size_global() << " cells, "
-                //   << msh->topology()->index_map(0)->size_global() << " vertices" << std::endl;
-
+        // ---- Mesh-only data: the same on every level ----
         std::vector<double> coeffs = piola_map(msh); // (n_cells, 12): 6 curl-curl then 6 mass
-        const std::size_t n_cells = coeffs.size() / 12;
-        // std::cout << "coeffs shape: (" << n_cells << ", 12)\n";
-        // std::cout << "cell 0 coeffs: ";
-        for (int k = 0; k < 12; ++k) std::cout << coeffs[k] << " ";
-        std::cout << "\n";
-
-        const int degree = 3;
-        auto element = basix::create_element<double>(
-            basix::element::family::N1E, basix::cell::type::tetrahedron, degree,
-            basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
-        std::vector<double> refs = curlcurl_reference_matrix(element, 2 * degree + 2);
-        const std::size_t nd = element.dim();
-
         permutation_class pc = permutation_classes(msh);
         std::cout << "permutation classes: " << pc.uniq.size() << "\n";
 
-        std::vector<double> Tdense = dense_transform(element, pc.uniq, false);
-        std::vector<double> Ttdense = dense_transform(element, pc.uniq, true);
+        // ---- Levels: index 0 = degree 1 (coarsest) ... index 2 = degree 3 (finest) ----
+        std::vector<level> levels;
+        for (int degree = 1; degree <= 3; ++degree)
+            levels.push_back(build_level(msh, pc, degree));
 
-        std::vector<double> folded = fold_reference(refs, Tdense, Ttdense, pc.uniq.size(), nd);
+        // Test: operator and diagonal (with BCs) on every level
+        for (std::size_t l = 0; l < levels.size(); ++l)
+        {
+            const level& L = levels[l];
+            std::vector<double> x(L.ndofs, 1.0);
+            std::vector<double> y = matvec_bc(x, L.bc_mask, coeffs, pc, L.elem_dim, L.folded, L.dofmap);
+            std::vector<double> d = diagonal_bc(L.bc_mask, coeffs, pc, L.elem_dim, L.folded, L.dofmap, L.ndofs);
+            std::cout << "level " << l << ": degree " << l + 1 << ", " << L.elem_dim << " dofs/cell, "
+                      << L.ndofs << " dofs, "
+                      << std::count(L.bc_mask.begin(), L.bc_mask.end(), 1.0) << " boundary dofs\n";
+        }
 
-
-        auto fe = std::make_shared<const dolfinx::fem::FiniteElement<double>>(element, 3);
-        auto V  = std::make_shared<dolfinx::fem::FunctionSpace<double>>(
-                    dolfinx::fem::create_functionspace<double>(msh, fe));
-        auto dofmap = V->dofmap()->map();
-        const std::int32_t ndofs = V->dofmap()->index_map->size_local();
-
-        std::vector<double> x(ndofs, 1.0);   // test input: all ones for now
-
-        std::vector<double> y_vec = matvec(x, coeffs, pc, nd, folded, dofmap);
-
-        std::vector<double> diag = getdiagonal(coeffs, pc, nd, folded, dofmap, ndofs);
-
-        // ---- Transfer operator: degree 1 -> degree 2 (step A setup) ----
+        // ---- Transfer operator: degree 1 -> degree 2 (levels[0] -> levels[1]) ----
+        const level& L_low  = levels[0];
+        const level& L_high = levels[1];
         auto e_low = basix::create_element<double>(
             basix::element::family::N1E, basix::cell::type::tetrahedron, 1,
             basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
         auto e_high = basix::create_element<double>(
             basix::element::family::N1E, basix::cell::type::tetrahedron, 2,
             basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
-        const int nd_low  = e_low.dim();   // 6
-        const int nd_high = e_high.dim();  // 20
 
         // Reference transfer matrix, shape (nd_high, nd_low)
         std::vector<double> interp_ref = reference_interpolation(e_low, e_high);
 
         // Per-class transforms: Tt for the source (low), Tt_inv for the destination (high)
-        std::vector<double> Ts = dense_transform(e_low,  pc.uniq, true);          // (n_class, nd_low,  nd_low)
-        std::vector<double> Td = dense_transform_inv(e_high, pc.uniq);       // (n_class, nd_high, nd_high)
-        std::cout << "interpolation_ref: " << nd_high << " x " << nd_low << "\n";
-        
-        std::vector<double> interp_folded = fold_interpolation(interp_ref, Ts, Td, pc.uniq.size(), nd_low, nd_high);
-
-        // Function spaces for the two degrees, to get their dofmaps
-        auto fe_low  = std::make_shared<const dolfinx::fem::FiniteElement<double>>(e_low, 3);
-        auto fe_high = std::make_shared<const dolfinx::fem::FiniteElement<double>>(e_high, 3);
-        auto V_low   = std::make_shared<dolfinx::fem::FunctionSpace<double>>(
-                           dolfinx::fem::create_functionspace<double>(msh, fe_low));
-        auto V_high  = std::make_shared<dolfinx::fem::FunctionSpace<double>>(
-                           dolfinx::fem::create_functionspace<double>(msh, fe_high));
-
-        auto dofmap_low  = V_low->dofmap()->map();   // (n_cells, 6)
-        auto dofmap_high = V_high->dofmap()->map();  // (n_cells, 20)
-        const std::int32_t ndofs_low  = V_low->dofmap()->index_map->size_local();
-        const std::int32_t ndofs_high = V_high->dofmap()->index_map->size_local();
+        std::vector<double> Ts = dense_transform(e_low, pc.uniq, true);   // (n_class, nd_low,  nd_low)
+        std::vector<double> Td = dense_transform_inv(e_high, pc.uniq);    // (n_class, nd_high, nd_high)
+        std::vector<double> interp_folded = fold_interpolation(interp_ref, Ts, Td, pc.uniq.size(),
+                                                               L_low.elem_dim, L_high.elem_dim);
 
         // Test: transfer a low-order vector up to the high-order space
-        std::vector<double> x_low(ndofs_low);
-        for (std::int32_t g = 0; g < ndofs_low; ++g) x_low[g] = std::sin(g);
-        std::vector<double> x_high = apply_transfer(x_low, interp_folded, pc, nd_low, nd_high,
-                                                    dofmap_low, dofmap_high, ndofs_high);
-        std::cout << "transfer: " << ndofs_low << " low dofs -> " << ndofs_high << " high dofs\n";
+        std::vector<double> x_low(L_low.ndofs);
+        for (std::int32_t g = 0; g < L_low.ndofs; ++g) x_low[g] = std::sin(g);
+        std::vector<double> x_high = apply_transfer(x_low, interp_folded, pc, L_low.elem_dim, L_high.elem_dim,
+                                                    L_low.dofmap, L_high.dofmap, L_high.ndofs);
+        std::cout << "transfer: " << L_low.ndofs << " low dofs -> " << x_high.size() << " high dofs\n";
 
         // Test: restrict a high-order vector down to the low-order space
-        std::vector<double> r_high(ndofs_high);
-        for (std::int32_t g = 0; g < ndofs_high; ++g) r_high[g] = std::cos(g);
-        std::vector<double> r_low = apply_transfer_transpose(r_high, interp_folded, pc, nd_low, nd_high,
-                                                             dofmap_low, dofmap_high, ndofs_low);
-        std::cout << "restriction: " << ndofs_high << " high dofs -> " << ndofs_low << " low dofs\n";
+        std::vector<double> r_high(L_high.ndofs);
+        for (std::int32_t g = 0; g < L_high.ndofs; ++g) r_high[g] = std::cos(g);
+        std::vector<double> r_low = apply_transfer_transpose(r_high, interp_folded, pc, L_low.elem_dim, L_high.elem_dim,
+                                                             L_low.dofmap, L_high.dofmap, L_low.ndofs);
+        std::cout << "restriction: " << L_high.ndofs << " high dofs -> " << r_low.size() << " low dofs\n";
 
+        // ---- Discrete gradient: Lagrange P3 -> Nedelec degree 3 (levels[2]) ----
+        const level& L_fine = levels[2];
+        auto element_curl = basix::create_element<double>(
+            basix::element::family::N1E, basix::cell::type::tetrahedron, 3,
+            basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
         auto element_h1 = basix::create_element<double>(
-            basix::element::family::P, basix::cell::type::tetrahedron, degree,
+            basix::element::family::P, basix::cell::type::tetrahedron, 3,
             basix::element::lagrange_variant::gll_warped, basix::element::dpc_variant::unset, false);
         const int nd_h1 = element_h1.dim(); // 20
 
-        // Reference gradient matrix, shape (nd, nd_h1) = (45, 20)
-        std::vector<double> grad_ref = discrete_gradient_reference(element_h1, element);
+        // Reference gradient matrix, shape (45, 20)
+        std::vector<double> grad_ref = discrete_gradient_reference(element_h1, element_curl);
 
+        // Lagrange side needs no transform (the dofmap handles it), so Ts is the identity
         std::vector<double> Ts_h1(pc.uniq.size() * nd_h1 * nd_h1, 0.0);
         for (std::size_t p = 0; p < pc.uniq.size(); ++p)
             for (int i = 0; i < nd_h1; ++i)
                 Ts_h1[p * nd_h1 * nd_h1 + i * nd_h1 + i] = 1.0;
-        std::vector<double> Td_curl = dense_transform_inv(element, pc.uniq);
-
-        // Folding has the same form as the transfer (Td · G_ref · Ts), so reuse fold_interpolation
-        std::vector<double> grad_folded = fold_interpolation(grad_ref, Ts_h1, Td_curl, pc.uniq.size(), nd_h1, nd);
+        std::vector<double> Td_curl = dense_transform_inv(element_curl, pc.uniq);
+        std::vector<double> grad_folded = fold_interpolation(grad_ref, Ts_h1, Td_curl, pc.uniq.size(),
+                                                             nd_h1, L_fine.elem_dim);
 
         // Lagrange function space for the source dofmap
-        auto fe_h1 = std::make_shared<const dolfinx::fem::FiniteElement<double>>(element_h1, 3);
+        auto fe_h1 = std::make_shared<const dolfinx::fem::FiniteElement<double>>(element_h1, msh->geometry().dim());
         auto V_h1  = std::make_shared<dolfinx::fem::FunctionSpace<double>>(
                          dolfinx::fem::create_functionspace<double>(msh, fe_h1));
         auto dofmap_h1 = V_h1->dofmap()->map();
         const std::int32_t ndofs_h1 = V_h1->dofmap()->index_map->size_local();
 
-        // Applying it is also the same as the transfer: shared Nédélec dofs get the same value from
-        // every cell, so apply_transfer's averaging gives the right answer
+        // Test: gradient of an H1 vector
         std::vector<double> u_h1(ndofs_h1);
         for (std::int32_t g = 0; g < ndofs_h1; ++g) u_h1[g] = std::sin(g);
-        std::vector<double> grad_u = apply_transfer(u_h1, grad_folded, pc, nd_h1, nd,
-                                                    dofmap_h1, dofmap, ndofs);
-        std::cout << "discrete gradient: " << ndofs_h1 << " H1 dofs -> " << ndofs << " H(curl) dofs\n";
-
-        // std::cout << "refs shape: (12, " << nd << ", " << nd << ")\n";
-        // std::cout << "R[0, 0, 0] = " << refs[0] << ", R[6, 0, 0] = " << refs[6 * nd * nd] << "\n";
+        std::vector<double> grad_u = apply_transfer(u_h1, grad_folded, pc, nd_h1, L_fine.elem_dim,
+                                                    dofmap_h1, L_fine.dofmap, L_fine.ndofs);
+        std::cout << "discrete gradient: " << ndofs_h1 << " H1 dofs -> " << grad_u.size() << " H(curl) dofs\n";
     }
     MPI_Finalize();
     return 0;
