@@ -680,6 +680,31 @@ level build_level(auto msh, const permutation_class& pc, int degree)
     return L;
 }
 
+struct transfer{
+    std::vector<double> interp_ref;
+    std::vector<double> Ts;
+    std::vector<double> Td;
+    std::vector<double> interp_folded;
+};
+
+transfer build_transfer(int degree_low, int degree_high, const permutation_class& pc)
+{
+    transfer T;
+
+    auto e_low = basix::create_element<double>(
+        basix::element::family::N1E, basix::cell::type::tetrahedron, degree_low,
+        basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
+    auto e_high = basix::create_element<double>(
+        basix::element::family::N1E, basix::cell::type::tetrahedron, degree_high,
+        basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
+
+    T.interp_ref = reference_interpolation(e_low, e_high);
+    T.Ts = dense_transform(e_low, pc.uniq, true);
+    T.Td = dense_transform_inv(e_high, pc.uniq);
+    T.interp_folded = fold_interpolation(T.interp_ref, T.Ts, T.Td, pc.uniq.size(), e_low.dim(), e_high.dim());
+
+    return T;
+}
 
 
 int main(int argc, char* argv[])
@@ -714,36 +739,29 @@ int main(int argc, char* argv[])
                       << std::count(L.bc_mask.begin(), L.bc_mask.end(), 1.0) << " boundary dofs\n";
         }
 
-        // ---- Transfer operator: degree 1 -> degree 2 (levels[0] -> levels[1]) ----
-        const level& L_low  = levels[0];
-        const level& L_high = levels[1];
-        auto e_low = basix::create_element<double>(
-            basix::element::family::N1E, basix::cell::type::tetrahedron, 1,
-            basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
-        auto e_high = basix::create_element<double>(
-            basix::element::family::N1E, basix::cell::type::tetrahedron, 2,
-            basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
+        level& L_low = levels[0];
+        level& L_high = levels[1];
 
-        // Reference transfer matrix, shape (nd_high, nd_low)
-        std::vector<double> interp_ref = reference_interpolation(e_low, e_high);
+        std::vector<int> degrees = {1, 2, 3};
+        std::vector<transfer> transfers;
 
-        // Per-class transforms: Tt for the source (low), Tt_inv for the destination (high)
-        std::vector<double> Ts = dense_transform(e_low, pc.uniq, true);   // (n_class, nd_low,  nd_low)
-        std::vector<double> Td = dense_transform_inv(e_high, pc.uniq);    // (n_class, nd_high, nd_high)
-        std::vector<double> interp_folded = fold_interpolation(interp_ref, Ts, Td, pc.uniq.size(),
-                                                               L_low.elem_dim, L_high.elem_dim);
+        for (int i = 0; i < degrees.size() - 1; i ++){
+            transfer T = build_transfer(degrees[i], degrees[i+1], pc);
+            transfers.push_back(T);
+        }
+
 
         // Test: transfer a low-order vector up to the high-order space
         std::vector<double> x_low(L_low.ndofs);
         for (std::int32_t g = 0; g < L_low.ndofs; ++g) x_low[g] = std::sin(g);
-        std::vector<double> x_high = apply_transfer(x_low, interp_folded, pc, L_low.elem_dim, L_high.elem_dim,
+        std::vector<double> x_high = apply_transfer(x_low, transfers[0].interp_folded, pc, L_low.elem_dim, L_high.elem_dim,
                                                     L_low.dofmap, L_high.dofmap, L_high.ndofs);
         std::cout << "transfer: " << L_low.ndofs << " low dofs -> " << x_high.size() << " high dofs\n";
 
         // Test: restrict a high-order vector down to the low-order space
         std::vector<double> r_high(L_high.ndofs);
         for (std::int32_t g = 0; g < L_high.ndofs; ++g) r_high[g] = std::cos(g);
-        std::vector<double> r_low = apply_transfer_transpose(r_high, interp_folded, pc, L_low.elem_dim, L_high.elem_dim,
+        std::vector<double> r_low = apply_transfer_transpose(r_high, transfers[0].interp_folded, pc, L_low.elem_dim, L_high.elem_dim,
                                                              L_low.dofmap, L_high.dofmap, L_low.ndofs);
         std::cout << "restriction: " << L_high.ndofs << " high dofs -> " << r_low.size() << " low dofs\n";
 
