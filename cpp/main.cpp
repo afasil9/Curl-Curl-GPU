@@ -29,6 +29,7 @@
 #include <dolfinx/mesh/utils.h>        // exterior_facet_indices
 #include <dolfinx/mesh/Mesh.h>
 #include <dolfinx/mesh/generation.h> // create_box (unit cube of tets)
+#include <petsc.h> // PETSc initialization (required before any dolfinx call)
 
 template <typename T>
 std::ostream& operator<<(std::ostream& os, const std::vector<T>& vec) {
@@ -706,10 +707,151 @@ transfer build_transfer(int degree_low, int degree_high, const permutation_class
     return T;
 }
 
+struct operator_data{
+    // We want the data which does the Matvec at each level
+    const level* L;
+    const std::vector<double>* coeffs;
+    const permutation_class* pc;
+}; 
+
+PetscErrorCode op_mult(Mat A, Vec x, Vec y)
+{
+    operator_data* data;
+    PetscCall(MatShellGetContext(A, &data));
+    const level* L = data->L;
+    const std::vector<double>* coeffs = data->coeffs;
+    const permutation_class* pc = data->pc;
+
+    const PetscScalar* x_array;
+    PetscCall(VecGetArrayRead(x, &x_array));
+    std::vector<double> x_vec(x_array, x_array + L->ndofs);
+    PetscCall(VecRestoreArrayRead(x, &x_array));
+
+    std::vector<double> y_vec = matvec_bc(x_vec, L->bc_mask, *coeffs, *pc, L->elem_dim, L->folded, L->dofmap);
+
+    PetscScalar* y_array;
+    PetscCall(VecGetArray(y, &y_array));
+    std::copy(y_vec.begin(), y_vec.end(), y_array);
+    PetscCall(VecRestoreArray(y, &y_array));
+
+    return PETSC_SUCCESS;
+
+}
+
+// d = diag(A): PETSc calls this (MATOP_GET_DIAGONAL) for the Jacobi / Chebyshev smoother
+PetscErrorCode op_diag(Mat A, Vec d)
+{
+    operator_data* data;
+    PetscCall(MatShellGetContext(A, &data));
+    const level* L = data->L;
+
+    std::vector<double> d_vec = diagonal_bc(L->bc_mask, *data->coeffs, *data->pc, L->elem_dim,
+                                            L->folded, L->dofmap, L->ndofs);
+
+    PetscScalar* d_array;
+    PetscCall(VecGetArray(d, &d_array));
+    std::copy(d_vec.begin(), d_vec.end(), d_array);
+    PetscCall(VecRestoreArray(d, &d_array));
+
+    return PETSC_SUCCESS;
+}
+
+struct transfer_data{
+    // The data to move a vector between two neighbouring levels
+    const level* L_low;
+    const level* L_high;
+    const transfer* T;
+    const permutation_class* pc;
+};
+
+// y_high = P x_low (prolongation). PETSc calls this (MATOP_MULT) to move a coarse correction up.
+// Boundary dofs are zeroed on both sides, so a correction never changes the Dirichlet dofs.
+PetscErrorCode interp_mult(Mat P, Vec x, Vec y)
+{
+    transfer_data* data;
+    PetscCall(MatShellGetContext(P, &data));
+    const level* Lo = data->L_low;
+    const level* Hi = data->L_high;
+
+    const PetscScalar* x_array;
+    PetscCall(VecGetArrayRead(x, &x_array));
+    std::vector<double> x_vec(x_array, x_array + Lo->ndofs);
+    PetscCall(VecRestoreArrayRead(x, &x_array));
+    for (std::int32_t g = 0; g < Lo->ndofs; ++g) x_vec[g] *= 1.0 - Lo->bc_mask[g];
+
+    std::vector<double> y_vec = apply_transfer(x_vec, data->T->interp_folded, *data->pc,
+                                               Lo->elem_dim, Hi->elem_dim, Lo->dofmap, Hi->dofmap, Hi->ndofs);
+    for (std::int32_t g = 0; g < Hi->ndofs; ++g) y_vec[g] *= 1.0 - Hi->bc_mask[g];
+
+    PetscScalar* y_array;
+    PetscCall(VecGetArray(y, &y_array));
+    std::copy(y_vec.begin(), y_vec.end(), y_array);
+    PetscCall(VecRestoreArray(y, &y_array));
+
+    return PETSC_SUCCESS;
+}
+
+// y_low = P^T x_high (restriction). PETSc calls this (MATOP_MULT_TRANSPOSE) to move a residual down.
+// Same masks as interp_mult, in the opposite order, so this is exactly its transpose.
+PetscErrorCode interp_mult_transpose(Mat P, Vec x, Vec y)
+{
+    transfer_data* data;
+    PetscCall(MatShellGetContext(P, &data));
+    const level* Lo = data->L_low;
+    const level* Hi = data->L_high;
+
+    const PetscScalar* x_array;
+    PetscCall(VecGetArrayRead(x, &x_array));
+    std::vector<double> x_vec(x_array, x_array + Hi->ndofs);
+    PetscCall(VecRestoreArrayRead(x, &x_array));
+    for (std::int32_t g = 0; g < Hi->ndofs; ++g) x_vec[g] *= 1.0 - Hi->bc_mask[g];
+
+    std::vector<double> y_vec = apply_transfer_transpose(x_vec, data->T->interp_folded, *data->pc,
+                                                         Lo->elem_dim, Hi->elem_dim, Lo->dofmap, Hi->dofmap, Lo->ndofs);
+    for (std::int32_t g = 0; g < Lo->ndofs; ++g) y_vec[g] *= 1.0 - Lo->bc_mask[g];
+
+    PetscScalar* y_array;
+    PetscCall(VecGetArray(y, &y_array));
+    std::copy(y_vec.begin(), y_vec.end(), y_array);
+    PetscCall(VecRestoreArray(y, &y_array));
+
+    return PETSC_SUCCESS;
+}
+
+// ---- Test helpers: copy between PETSc Vec and std::vector ----
+std::vector<double> to_std(Vec v)
+{
+    PetscInt n;
+    const PetscScalar* a;
+    PetscCallAbort(PETSC_COMM_SELF, VecGetLocalSize(v, &n));
+    PetscCallAbort(PETSC_COMM_SELF, VecGetArrayRead(v, &a));
+    std::vector<double> out(a, a + n);
+    PetscCallAbort(PETSC_COMM_SELF, VecRestoreArrayRead(v, &a));
+    return out;
+}
+
+Vec to_petsc(const std::vector<double>& s)
+{
+    Vec v;
+    PetscScalar* a;
+    PetscCallAbort(PETSC_COMM_SELF, VecCreateSeq(PETSC_COMM_SELF, s.size(), &v));
+    PetscCallAbort(PETSC_COMM_SELF, VecGetArray(v, &a));
+    std::copy(s.begin(), s.end(), a);
+    PetscCallAbort(PETSC_COMM_SELF, VecRestoreArray(v, &a));
+    return v;
+}
+
+double max_diff(const std::vector<double>& a, const std::vector<double>& b)
+{
+    double m = 0.0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        m = std::max(m, std::abs(a[i] - b[i]));
+    return m;
+}
 
 int main(int argc, char* argv[])
 {
-    MPI_Init(&argc, &argv);
+    PetscInitialize(&argc, &argv, nullptr, nullptr);
     dolfinx::init_logging(argc, argv);
     {
         auto msh = std::make_shared<dolfinx::mesh::Mesh<double>>(
@@ -800,7 +942,96 @@ int main(int argc, char* argv[])
         std::vector<double> grad_u = apply_transfer(u_h1, grad_folded, pc, nd_h1, L_fine.elem_dim,
                                                     dofmap_h1, L_fine.dofmap, L_fine.ndofs);
         std::cout << "discrete gradient: " << ndofs_h1 << " H1 dofs -> " << grad_u.size() << " H(curl) dofs\n";
+
+        
+        std::vector<operator_data> op_data(levels.size());
+        std::vector<Mat> A(levels.size());
+        for (std::size_t l = 0; l < levels.size(); ++l)
+        {
+            op_data[l] = {&levels[l], &coeffs, &pc};
+            const PetscInt n = levels[l].ndofs;
+            // A matrix that stores no values: PETSc calls op_mult / op_diag instead
+            PetscCall(MatCreateShell(PETSC_COMM_SELF, n, n, n, n, &op_data[l], &A[l]));
+            PetscCall(MatShellSetOperation(A[l], MATOP_MULT, (void (*)(void))op_mult));
+            PetscCall(MatShellSetOperation(A[l], MATOP_GET_DIAGONAL, (void (*)(void))op_diag));
+        }
+
+        std::vector<transfer_data> tr_data(transfers.size());
+        std::vector<Mat> P(transfers.size());
+        for (std::size_t l = 0; l < transfers.size(); ++l)
+        {
+            tr_data[l] = {&levels[l], &levels[l + 1], &transfers[l], &pc};
+            const PetscInt n_low  = levels[l].ndofs;
+            const PetscInt n_high = levels[l + 1].ndofs;
+            
+            // Create Petsc matrix that holds a pointer to tr_data.
+            PetscCall(MatCreateShell(PETSC_COMM_SELF, n_high, n_low, n_high, n_low, &tr_data[l], &P[l]));
+            PetscCall(MatShellSetOperation(P[l], MATOP_MULT, (void (*)(void))interp_mult));
+            PetscCall(MatShellSetOperation(P[l], MATOP_MULT_TRANSPOSE, (void (*)(void))interp_mult_transpose));
+        }
+
+        for (std::size_t l = 0; l < levels.size(); ++l)
+        {
+            const level& L = levels[l];
+            std::vector<double> xs(L.ndofs);
+            for (std::int32_t g = 0; g < L.ndofs; ++g) xs[g] = std::sin(g);
+
+            Vec xv = to_petsc(xs), yv, dv;
+            PetscCall(VecDuplicate(xv, &yv));
+            PetscCall(VecDuplicate(xv, &dv));
+            PetscCall(MatMult(A[l], xv, yv));
+            PetscCall(MatGetDiagonal(A[l], dv));
+
+            std::vector<double> y_ref = matvec_bc(xs, L.bc_mask, coeffs, pc, L.elem_dim, L.folded, L.dofmap);
+            std::vector<double> d_ref = diagonal_bc(L.bc_mask, coeffs, pc, L.elem_dim, L.folded, L.dofmap, L.ndofs);
+            std::cout << "A[" << l << "]: MatMult diff = " << max_diff(to_std(yv), y_ref)
+                      << ", MatGetDiagonal diff = " << max_diff(to_std(dv), d_ref) << "\n";
+
+            PetscCall(VecDestroy(&xv));
+            PetscCall(VecDestroy(&yv));
+            PetscCall(VecDestroy(&dv));
+        }
+
+        // ---- Test: each P[l] must match apply_transfer, and MatMultTranspose must be its exact transpose ----
+        for (std::size_t l = 0; l < transfers.size(); ++l)
+        {
+            const level& Lo = levels[l];
+            const level& Hi = levels[l + 1];
+            std::vector<double> xs(Lo.ndofs), ys(Hi.ndofs);
+            for (std::int32_t g = 0; g < Lo.ndofs; ++g) xs[g] = std::sin(g);
+            for (std::int32_t g = 0; g < Hi.ndofs; ++g) ys[g] = std::cos(g);
+
+            Vec xl = to_petsc(xs), yh = to_petsc(ys), Px, PTy;
+            PetscCall(VecDuplicate(yh, &Px));
+            PetscCall(VecDuplicate(xl, &PTy));
+            PetscCall(MatMult(P[l], xl, Px));
+            PetscCall(MatMultTranspose(P[l], yh, PTy));
+
+            // Reference: apply_transfer with the same boundary masking as interp_mult
+            std::vector<double> xm = xs;
+            for (std::int32_t g = 0; g < Lo.ndofs; ++g) xm[g] *= 1.0 - Lo.bc_mask[g];
+            std::vector<double> Px_ref = apply_transfer(xm, transfers[l].interp_folded, pc, Lo.elem_dim, Hi.elem_dim,
+                                                        Lo.dofmap, Hi.dofmap, Hi.ndofs);
+            for (std::int32_t g = 0; g < Hi.ndofs; ++g) Px_ref[g] *= 1.0 - Hi.bc_mask[g];
+
+            // Transpose check: (P x) . y must equal x . (P^T y)
+            PetscScalar Px_dot_y, x_dot_PTy;
+            PetscCall(VecDot(Px, yh, &Px_dot_y));
+            PetscCall(VecDot(xl, PTy, &x_dot_PTy));
+
+            std::cout << "P[" << l << "] (degree " << l + 1 << " -> " << l + 2 << "): MatMult diff = "
+                      << max_diff(to_std(Px), Px_ref)
+                      << ", |Px.y - x.PTy| = " << std::abs(Px_dot_y - x_dot_PTy) << "\n";
+
+            PetscCall(VecDestroy(&xl));
+            PetscCall(VecDestroy(&yh));
+            PetscCall(VecDestroy(&Px));
+            PetscCall(VecDestroy(&PTy));
+        }
+
+        for (Mat& M : A) PetscCall(MatDestroy(&M));
+        for (Mat& M : P) PetscCall(MatDestroy(&M));
     }
-    MPI_Finalize();
+    PetscFinalize();
     return 0;
 }
