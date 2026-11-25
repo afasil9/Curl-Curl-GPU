@@ -1029,8 +1029,74 @@ int main(int argc, char* argv[])
             PetscCall(VecDestroy(&PTy));
         }
 
+        KSP ksp;
+        PC pc_mg;
+
+        PetscCall(KSPCreate(PETSC_COMM_SELF, &ksp));
+        PetscCall(KSPSetOperators(ksp, A[2], A[2])); // Use the finest level operator
+        PetscCall(KSPGetPC(ksp, &pc_mg));
+        PetscCall(PCSetType(pc_mg, PCMG));
+
+        PetscCall(PCMGSetLevels(pc_mg, levels.size(), nullptr));
+    
+    // Multigrid setup
+    for (int l = 0; l < levels.size(); ++l)
+        {
+            KSP smoother;
+            PC smoother_pc;
+            PetscCall(PCMGGetSmoother(pc_mg, l, &smoother));
+            PetscCall(KSPSetOperators(smoother, A[l], A[l]));
+            PetscCall(KSPGetPC(smoother, &smoother_pc));
+            PetscCall(PCSetType(smoother_pc, PCJACOBI));
+
+            if (l == 0)
+            {
+                // Coarsest level: solve (nearly) exactly with CG + Jacobi
+                PetscCall(KSPSetType(smoother, KSPCG));
+                PetscCall(KSPSetTolerances(smoother, 1e-10, PETSC_DEFAULT, PETSC_DEFAULT, 1000));
+            }
+            else
+            {
+                PetscCall(KSPSetType(smoother, KSPCHEBYSHEV));
+                PetscCall(KSPChebyshevEstEigSet(smoother, PETSC_DETERMINE, PETSC_DETERMINE,
+                                                PETSC_DETERMINE, PETSC_DETERMINE));
+            }
+        }
+
+        for (int l = 1; l < levels.size(); ++l)
+            PetscCall(PCMGSetInterpolation(pc_mg, l, P[l - 1]));
+
+
+        PetscCall(KSPSetType(ksp, KSPFCG));
+        PetscCall(KSPSetTolerances(ksp, 1e-8, PETSC_DEFAULT, PETSC_DEFAULT, 500));
+        PetscCall(KSPSetFromOptions(ksp));
+
+        const level& L_solve = levels[2];
+        std::vector<double> b_vec(L_solve.ndofs, 1.0);
+        for (std::int32_t g = 0; g < L_solve.ndofs; ++g)
+            if (L_solve.bc_mask[g] == 1.0) b_vec[g] = 0.0;   // u = 0 on the boundary
+        Vec b = to_petsc(b_vec);
+        Vec u;
+        PetscCall(VecDuplicate(b, &u));
+
+        PetscCall(KSPSolve(ksp, b, u));
+
+        KSPConvergedReason reason;
+        PetscInt iterations;
+        PetscReal residual;
+        PetscCall(KSPGetConvergedReason(ksp, &reason));
+        PetscCall(KSPGetIterationNumber(ksp, &iterations));
+        PetscCall(KSPGetResidualNorm(ksp, &residual));
+        std::cout << "PMG solve: " << KSPConvergedReasons[reason] << " in " << iterations
+                  << " iterations, residual norm " << residual << "\n";
+
+        PetscCall(VecDestroy(&b));
+        PetscCall(VecDestroy(&u));
+
+
         for (Mat& M : A) PetscCall(MatDestroy(&M));
         for (Mat& M : P) PetscCall(MatDestroy(&M));
+        PetscCall(KSPDestroy(&ksp));
     }
     PetscFinalize();
     return 0;
