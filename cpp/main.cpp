@@ -206,7 +206,7 @@ std::vector<double> curlcurl_reference_matrix(const basix::FiniteElement<double>
     double b = T(1, 0, 0 , 0);
     double c = T(2, 0, 0 , 0);
 
-    std::cout << "T(0, 0, 0, 0) = " << a << ", T(1, 0, 0, 0) = " << b << ", T(2, 0, 0, 0) = " << c << "\n";
+    // std::cout << "T(0, 0, 0, 0) = " << a << ", T(1, 0, 0, 0) = " << b << ", T(2, 0, 0, 0) = " << c << "\n";
 
 
     double phi_x = T(0, 0, 0, 0); // x component of basis funciton 0 at point 0
@@ -862,7 +862,7 @@ int main(int argc, char* argv[])
         // ---- Mesh-only data: the same on every level ----
         std::vector<double> coeffs = piola_map(msh); // (n_cells, 12): 6 curl-curl then 6 mass
         permutation_class pc = permutation_classes(msh);
-        std::cout << "permutation classes: " << pc.uniq.size() << "\n";
+        // std::cout << "permutation classes: " << pc.uniq.size() << "\n";
 
         // ---- Levels: index 0 = degree 1 (coarsest) ... index 2 = degree 3 (finest) ----
         std::vector<level> levels;
@@ -898,14 +898,14 @@ int main(int argc, char* argv[])
         for (std::int32_t g = 0; g < L_low.ndofs; ++g) x_low[g] = std::sin(g);
         std::vector<double> x_high = apply_transfer(x_low, transfers[0].interp_folded, pc, L_low.elem_dim, L_high.elem_dim,
                                                     L_low.dofmap, L_high.dofmap, L_high.ndofs);
-        std::cout << "transfer: " << L_low.ndofs << " low dofs -> " << x_high.size() << " high dofs\n";
+        // std::cout << "transfer: " << L_low.ndofs << " low dofs -> " << x_high.size() << " high dofs\n";
 
         // Test: restrict a high-order vector down to the low-order space
         std::vector<double> r_high(L_high.ndofs);
         for (std::int32_t g = 0; g < L_high.ndofs; ++g) r_high[g] = std::cos(g);
         std::vector<double> r_low = apply_transfer_transpose(r_high, transfers[0].interp_folded, pc, L_low.elem_dim, L_high.elem_dim,
                                                              L_low.dofmap, L_high.dofmap, L_low.ndofs);
-        std::cout << "restriction: " << L_high.ndofs << " high dofs -> " << r_low.size() << " low dofs\n";
+        // std::cout << "restriction: " << L_high.ndofs << " high dofs -> " << r_low.size() << " low dofs\n";
 
         // ---- Discrete gradient: Lagrange P3 -> Nedelec degree 3 (levels[2]) ----
         const level& L_fine = levels[2];
@@ -941,7 +941,7 @@ int main(int argc, char* argv[])
         for (std::int32_t g = 0; g < ndofs_h1; ++g) u_h1[g] = std::sin(g);
         std::vector<double> grad_u = apply_transfer(u_h1, grad_folded, pc, nd_h1, L_fine.elem_dim,
                                                     dofmap_h1, L_fine.dofmap, L_fine.ndofs);
-        std::cout << "discrete gradient: " << ndofs_h1 << " H1 dofs -> " << grad_u.size() << " H(curl) dofs\n";
+        // std::cout << "discrete gradient: " << ndofs_h1 << " H1 dofs -> " << grad_u.size() << " H(curl) dofs\n";
 
         
         std::vector<operator_data> op_data(levels.size());
@@ -984,8 +984,8 @@ int main(int argc, char* argv[])
 
             std::vector<double> y_ref = matvec_bc(xs, L.bc_mask, coeffs, pc, L.elem_dim, L.folded, L.dofmap);
             std::vector<double> d_ref = diagonal_bc(L.bc_mask, coeffs, pc, L.elem_dim, L.folded, L.dofmap, L.ndofs);
-            std::cout << "A[" << l << "]: MatMult diff = " << max_diff(to_std(yv), y_ref)
-                      << ", MatGetDiagonal diff = " << max_diff(to_std(dv), d_ref) << "\n";
+            // std::cout << "A[" << l << "]: MatMult diff = " << max_diff(to_std(yv), y_ref)
+                      // << ", MatGetDiagonal diff = " << max_diff(to_std(dv), d_ref) << "\n";
 
             PetscCall(VecDestroy(&xv));
             PetscCall(VecDestroy(&yv));
@@ -1019,9 +1019,9 @@ int main(int argc, char* argv[])
             PetscCall(VecDot(Px, yh, &Px_dot_y));
             PetscCall(VecDot(xl, PTy, &x_dot_PTy));
 
-            std::cout << "P[" << l << "] (degree " << l + 1 << " -> " << l + 2 << "): MatMult diff = "
-                      << max_diff(to_std(Px), Px_ref)
-                      << ", |Px.y - x.PTy| = " << std::abs(Px_dot_y - x_dot_PTy) << "\n";
+            // std::cout << "P[" << l << "] (degree " << l + 1 << " -> " << l + 2 << "): MatMult diff = "
+                      // << max_diff(to_std(Px), Px_ref)
+                      // << ", |Px.y - x.PTy| = " << std::abs(Px_dot_y - x_dot_PTy) << "\n";
 
             PetscCall(VecDestroy(&xl));
             PetscCall(VecDestroy(&yh));
