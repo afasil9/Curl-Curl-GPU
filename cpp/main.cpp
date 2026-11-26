@@ -856,9 +856,6 @@ double max_diff(const std::vector<double>& a, const std::vector<double>& b)
     return m;
 }
 
-// ---- AMS coarse solve (hypre) ----
-// AMS needs real matrix entries, so the small degree-1 level is assembled. It also needs the
-// discrete gradient G (Lagrange P1 -> Nedelec degree 1) and the P1 dof (vertex) coordinates.
 struct ams_data{
     Mat A0;                      // assembled level-0 operator (from the UFL form in curlcurl.py)
     Mat G0;                      // assembled discrete gradient, (level-0 ndofs) x (P1 ndofs)
@@ -867,14 +864,10 @@ struct ams_data{
 
 PetscErrorCode build_ams_data(auto msh, const permutation_class& pc, const level& L0, ams_data& ams)
 {
-    // 1. Assemble A0 the standard DOLFINx way, from the UFL form, on level 0's own function
-    //    space (so the dof numbering matches the shells and transfers)
     auto a = dolfinx::fem::create_form<PetscScalar>(*form_curlcurl_a, {L0.V, L0.V}, {}, {}, {}, {});
     ams.A0 = dolfinx::fem::petsc::create_matrix(a);
     PetscCall(MatZeroEntries(ams.A0));
 
-    // Boundary dofs: their rows and columns are skipped during assembly, then 1 goes on their
-    // diagonal. That is the same identity-on-the-boundary treatment as matvec_bc
     std::vector<std::int8_t> bc_marker(L0.bc_mask.begin(), L0.bc_mask.end());
     dolfinx::fem::assemble_matrix(dolfinx::la::petsc::Matrix::set_block_fn(ams.A0, ADD_VALUES), a,
                                   bc_marker, bc_marker);
@@ -884,7 +877,6 @@ PetscErrorCode build_ams_data(auto msh, const permutation_class& pc, const level
     PetscCall(MatAssemblyBegin(ams.A0, MAT_FINAL_ASSEMBLY));
     PetscCall(MatAssemblyEnd(ams.A0, MAT_FINAL_ASSEMBLY));
 
-    // 2. The P1 Lagrange space: the nodal space AMS works in
     auto e_p1 = basix::create_element<double>(
         basix::element::family::P, basix::cell::type::tetrahedron, 1,
         basix::element::lagrange_variant::gll_warped, basix::element::dpc_variant::unset, false);
@@ -910,9 +902,6 @@ PetscErrorCode build_ams_data(auto msh, const permutation_class& pc, const level
     std::vector<double> Td = dense_transform_inv(e_n1, pc.uniq);
     std::vector<double> G_folded = fold_interpolation(G_ref, Ts, Td, n_class, nd_p1, nd_n1);
 
-    // 4. Assemble G: each cell inserts its local 6x4 block. A shared edge gets the same value from
-    //    every cell, so INSERT_VALUES is safe. Round-off entries are skipped, so G is the clean
-    //    edge-vertex incidence matrix (two entries per row)
     PetscCall(MatCreateSeqAIJ(PETSC_COMM_SELF, L0.ndofs, n_p1, nd_p1, nullptr, &ams.G0));
     const std::size_t n_cells = dofmap_p1.extent(0);
     for (std::size_t c = 0; c < n_cells; ++c)
@@ -932,7 +921,84 @@ PetscErrorCode build_ams_data(auto msh, const permutation_class& pc, const level
     return PETSC_SUCCESS;
 }
 
-// Turn the coarse-level KSP into: CG on the assembled A0, preconditioned with hypre AMS
+struct gradient{
+    std::shared_ptr<dolfinx::fem::FunctionSpace<double>> V;   // Lagrange space
+    int elem_dim;                                             // Lagrange dofs per cell
+    std::int32_t ndofs;                                       // Lagrange global dofs
+    std::vector<double> folded;                               // folded G, (n_class, nd_curl, nd_h1)
+    dolfinx::md::mdspan<const std::int32_t,
+                        dolfinx::md::dextents<std::size_t, 2>> dofmap;   // Lagrange dofmap
+    std::vector<double> bc_mask;                              // 1 on boundary Lagrange dofs
+};
+
+gradient build_gradient(auto msh, const permutation_class& pc, int degree)
+{
+    gradient G;
+
+    auto e_h1 = basix::create_element<double>(
+        basix::element::family::P, basix::cell::type::tetrahedron, degree,
+        basix::element::lagrange_variant::gll_warped, basix::element::dpc_variant::unset, false);
+    auto e_curl = basix::create_element<double>(
+        basix::element::family::N1E, basix::cell::type::tetrahedron, degree,
+        basix::element::lagrange_variant::legendre, basix::element::dpc_variant::unset, false);
+
+    auto fe_h1 = std::make_shared<const dolfinx::fem::FiniteElement<double>>(e_h1, msh->geometry().dim());
+    G.V = std::make_shared<dolfinx::fem::FunctionSpace<double>>(
+                    dolfinx::fem::create_functionspace<double>(msh, fe_h1));
+    G.elem_dim = e_h1.dim();
+    G.ndofs = G.V->dofmap()->index_map->size_local();
+    G.dofmap = G.V->dofmap()->map();
+    G.bc_mask = boundary_dof_mask(msh, G.V, G.ndofs);
+
+    const int nd_curl = e_curl.dim();
+    const int nd_h1 = e_h1.dim();
+    const std::size_t n_class = pc.uniq.size();
+    std::vector<double> G_ref = discrete_gradient_reference(e_h1, e_curl);   // (nd_curl, nd_h1)
+    std::vector<double> Ts(n_class * nd_h1 * nd_h1, 0.0);  // identity: the dofmap handles Lagrange
+    for (std::size_t p = 0; p < n_class; ++p)
+        for (int i = 0; i < nd_h1; ++i)
+            Ts[p * nd_h1 * nd_h1 + i * nd_h1 + i] = 1.0;
+    std::vector<double> Td = dense_transform_inv(e_curl, pc.uniq);
+    G.folded = fold_interpolation(G_ref, Ts, Td, n_class, nd_h1, nd_curl);
+
+    return G;
+}
+
+
+std::vector<double> apply_G(const std::vector<double>& u_h1, const gradient& Gr,
+                            const level& L, const permutation_class& pc)
+{
+    std::vector<double> u_masked = u_h1;
+    for (std::int32_t j = 0; j < Gr.ndofs; ++j)
+        u_masked[j] *= 1.0 - Gr.bc_mask[j];
+
+    std::vector<double> g = apply_transfer(u_masked, Gr.folded, pc, Gr.elem_dim, L.elem_dim,
+                                           Gr.dofmap, L.dofmap, L.ndofs);
+
+    for (std::int32_t n = 0; n < L.ndofs; ++n)
+        g[n] *= 1.0 - L.bc_mask[n];
+
+    return g;
+}
+
+// Applies transpose of discrete gradient
+std::vector<double> apply_Gt(const std::vector<double>& r_curl, const gradient& Gr,
+                             const level& L, const permutation_class& pc)
+{
+
+    std::vector<double> r_masked = r_curl;
+    for (std::int32_t n = 0; n < L.ndofs; ++n)
+        r_masked[n] *= 1.0 - L.bc_mask[n];
+
+    std::vector<double> gt = apply_transfer_transpose(r_masked, Gr.folded, pc, Gr.elem_dim, L.elem_dim,
+                                                        Gr.dofmap, L.dofmap, Gr.ndofs);
+
+    for (std::int32_t j = 0; j < Gr.ndofs; ++j)
+        gt[j] *= 1.0 - Gr.bc_mask[j];
+
+    return gt;
+}
+
 PetscErrorCode setup_ams_coarse(KSP coarse, ams_data& ams)
 {
     PC coarse_pc;
@@ -948,6 +1014,62 @@ PetscErrorCode setup_ams_coarse(KSP coarse, ams_data& ams)
 
     return PETSC_SUCCESS;
 }
+
+//   D_n[j] += g_j^T · A_c · g_j      (g_j = column j of the cell's gradient, A_c = cell matrix)
+std::vector<double> diag_gtAg(const gradient& G, const level& L,
+                              const std::vector<double>& coeffs, const permutation_class& pc)
+{
+    std::vector<double> D_n(G.ndofs, 0.0);
+
+    const int nd    = L.elem_dim;    // Nedelec dofs per cell
+    const int nd_h1 = G.elem_dim;    // Lagrange dofs per cell
+    std::vector<double> A_c(nd * nd);        // cell matrix
+    std::vector<double> G_c(nd * nd_h1);     // discrete gradient cell wise
+    std::vector<double> W(nd * nd_h1);       // interemdiate product A_c · G_c
+
+    for (std::size_t c = 0; c < pc.clas.size(); ++c)
+    {
+        const int p = pc.clas[c];
+
+        std::fill(A_c.begin(), A_c.end(), 0.0);
+        for (int k = 0; k < 12; ++k)
+            for (int i = 0; i < nd; ++i)
+                for (int m = 0; m < nd; ++m)
+                    A_c[i * nd + m] += coeffs[12 * c + k] * L.folded[((p * 12 + k) * nd + i) * nd + m];
+
+        for (int m = 0; m < nd; ++m)
+            for (int j = 0; j < nd_h1; ++j)
+                G_c[m * nd_h1 + j] = G.folded[(p * nd + m) * nd_h1 + j]
+                                     * (1.0 - L.bc_mask[L.dofmap(c, m)]);
+
+        // W = A_c · G_c
+        for (int i = 0; i < nd; ++i)
+            for (int j = 0; j < nd_h1; ++j)
+            {
+                double sum = 0.0;
+                for (int m = 0; m < nd; ++m)
+                    sum += A_c[i * nd + m] * G_c[m * nd_h1 + j];
+                W[i * nd_h1 + j] = sum;
+            }
+
+        for (int j = 0; j < nd_h1; ++j)
+        {
+            double sum = 0.0;
+            for (int i = 0; i < nd; ++i)
+                sum += G_c[i * nd_h1 + j] * W[i * nd_h1 + j];
+            D_n[G.dofmap(c, j)] += sum;
+        }
+    }
+
+    for (std::int32_t j = 0; j < G.ndofs; ++j)
+        if (G.bc_mask[j] == 1.0)
+            D_n[j] = 1.0;
+
+    return D_n;
+}
+
+
+
 
 int main(int argc, char* argv[])
 {
@@ -968,6 +1090,12 @@ int main(int argc, char* argv[])
         std::vector<level> levels;
         for (int degree = 1; degree <= 3; ++degree)
             levels.push_back(build_level(msh, pc, degree));
+        
+        // Create discrete gradietn
+
+        std::vector<gradient> gradients;
+        for (int degree = 1; degree <= 3; ++degree)
+            gradients.push_back(build_gradient(msh, pc, degree));
 
         // Test: operator and diagonal (with BCs) on every level
         for (std::size_t l = 0; l < levels.size(); ++l)
@@ -983,6 +1111,7 @@ int main(int argc, char* argv[])
 
         level& L_low = levels[0];
         level& L_high = levels[1];
+        gradient G = build_gradient(msh, pc, 1);
 
         std::vector<int> degrees = {1, 2, 3};
         std::vector<transfer> transfers;
@@ -1195,7 +1324,6 @@ int main(int argc, char* argv[])
 
         PetscCall(VecDestroy(&b));
         PetscCall(VecDestroy(&u));
-
 
         PetscCall(KSPDestroy(&ksp));
         for (Mat& M : A) PetscCall(MatDestroy(&M));
