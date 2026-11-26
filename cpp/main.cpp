@@ -31,6 +31,7 @@
 #include <dolfinx/mesh/generation.h> // create_box (unit cube of tets)
 #include <dolfinx/fem/assembler.h>    // assemble_matrix (assembled AMS coarse matrix)
 #include <dolfinx/fem/form_factory.h> // create_form
+#include <dolfinx/fem/Function.h>     // Function (computed solution for the error forms)
 #include <dolfinx/fem/petsc.h>        // fem::petsc::create_matrix
 #include <dolfinx/la/petsc.h>         // la::petsc::Matrix::set_block_fn
 #include <petsc.h> // PETSc initialization (required before any dolfinx call)
@@ -1143,9 +1144,13 @@ int main(int argc, char* argv[])
     PetscInitialize(&argc, &argv, nullptr, nullptr);
     dolfinx::init_logging(argc, argv);
     {
+        // Cells per direction, from the command line: ./build/main -N 8   (default 4)
+        PetscInt N = 4;
+        PetscCall(PetscOptionsGetInt(nullptr, nullptr, "-N", &N, nullptr));
+
         auto msh = std::make_shared<dolfinx::mesh::Mesh<double>>(
             dolfinx::mesh::create_box<double>(
-                MPI_COMM_WORLD, {{{0.0, 0.0, 0.0}, {1.0, 1.0, 1.0}}}, {4, 4, 4},
+                MPI_COMM_WORLD, {{{0.0, 0.0, 0.0}, {1.0, 1.0, 1.0}}}, {N, N, N},
                 dolfinx::mesh::CellType::tetrahedron));
 
         // ---- Mesh-only data: the same on every level ----
@@ -1400,12 +1405,14 @@ int main(int argc, char* argv[])
             PetscCall(PCMGSetInterpolation(pc_mg, l, P[l - 1]));
 
 
-        PetscCall(KSPSetType(ksp, KSPFCG));
+        PetscCall(KSPSetType(ksp, KSPCG));
         PetscCall(KSPSetTolerances(ksp, 1e-8, PETSC_DEFAULT, PETSC_DEFAULT, 500));
         PetscCall(KSPSetFromOptions(ksp));
 
         const level& L_solve = levels[2];
-        std::vector<double> b_vec(L_solve.ndofs, 1.0);
+        auto L_form = dolfinx::fem::create_form<PetscScalar>(*form_curlcurl_L, {L_solve.V}, {}, {}, {}, {});
+        std::vector<double> b_vec(L_solve.ndofs, 0.0);
+        dolfinx::fem::assemble_vector(std::span<double>(b_vec), L_form);
         for (std::int32_t g = 0; g < L_solve.ndofs; ++g)
             if (L_solve.bc_mask[g] == 1.0) b_vec[g] = 0.0;   // u = 0 on the boundary
         Vec b = to_petsc(b_vec);
@@ -1422,6 +1429,20 @@ int main(int argc, char* argv[])
         PetscCall(KSPGetResidualNorm(ksp, &residual));
         std::cout << "PMG solve: " << KSPConvergedReasons[reason] << " in " << iterations
                   << " iterations, residual norm " << residual << "\n";
+
+        auto uh = std::make_shared<dolfinx::fem::Function<double>>(L_solve.V);
+        {
+            const PetscScalar* u_array;
+            PetscCall(VecGetArrayRead(u, &u_array));
+            std::copy(u_array, u_array + L_solve.ndofs, uh->x()->array().begin());
+            PetscCall(VecRestoreArrayRead(u, &u_array));
+        }
+        auto M_L2 = dolfinx::fem::create_form<PetscScalar, double>(*form_curlcurl_M_L2, {}, {{"uh", uh}}, {}, {}, {}, msh);
+        auto M_curl = dolfinx::fem::create_form<PetscScalar, double>(*form_curlcurl_M_curl, {}, {{"uh", uh}}, {}, {}, {}, msh);
+        const double err_L2 = std::sqrt(dolfinx::fem::assemble_scalar(M_L2));
+        const double err_curl = std::sqrt(dolfinx::fem::assemble_scalar(M_curl));
+        std::cout << "N = " << N << ", h = " << 1.0 / N << ":  ||u - u_h||_L2 = " << err_L2
+                  << ",  ||curl(u - u_h)||_L2 = " << err_curl << "\n";
 
         PetscCall(VecDestroy(&b));
         PetscCall(VecDestroy(&u));
