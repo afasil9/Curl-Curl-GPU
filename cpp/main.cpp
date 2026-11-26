@@ -1069,6 +1069,73 @@ std::vector<double> diag_gtAg(const gradient& G, const level& L,
 }
 
 
+// Jacobi smoother is x_new = x_old + D_n_inv * (b - A x_old), where D_n_inv is the inverse of the diagonal of G^T A G
+struct hiptmair_data{
+    std::vector<double> D_n_inv;  // Inverse of diagonal of G^T A G, for Jacobi smoother
+    std::vector<double> D_e_inv;  // Inverse of diagonal of A, for Jacobi smoother
+    double omega;
+    const level* L;
+    const std::vector<double>* coeffs;
+    const gradient* G;
+    const permutation_class* pc;
+};
+
+// Hiptmair smoothing
+// 1. z  = ω · D_e⁻¹ · r
+// 2. r₂ = r − A z               (matvec_bc)
+// 3. z += G · (ω · D_n⁻¹ · Gᵀ r₂)  (apply_Gt, then apply_G)
+
+std::vector<double> hiptmair_smooth(const std::vector<double>& r, const hiptmair_data& data)
+{
+    std::vector<double> z(data.L->ndofs, 0.0);
+    std::vector<double> r2(data.L->ndofs, 0.0);
+    std::vector<double> Az(data.L->ndofs, 0.0);
+
+    // Step 1: z = ω · D_e⁻¹ · r
+    for (int n =0; n < data.L->ndofs; ++n)
+        z[n] = data.omega * data.D_e_inv[n] * r[n];
+
+    // Step 2: r₂ = r − A z
+    Az = matvec_bc(z, data.L->bc_mask, *data.coeffs, *data.pc, data.L->elem_dim, data.L->folded, data.L->dofmap);
+    for (int n =0; n < data.L->ndofs; ++n)
+        r2[n] = r[n] - Az[n];
+
+    // Step 3: z += G · (ω · D_n⁻¹ · Gᵀ r₂)
+    std::vector<double> Gt_r2 = apply_Gt(r2, *data.G, *data.L, *data.pc);
+    for (int j =0; j < data.G->ndofs; ++j)
+        Gt_r2[j] *= data.omega * data.D_n_inv[j];
+    
+    std::vector<double> G_Gt_r2 = apply_G(Gt_r2, *data.G, *data.L, *data.pc);
+    for (int n =0; n < data.L->ndofs; ++n)
+        z[n] += G_Gt_r2[n];
+
+    return z;
+
+}
+
+PetscErrorCode hiptmair_apply(PC pc, Vec r, Vec z)
+{
+    hiptmair_data* data;
+    PetscCall(PCShellGetContext(pc, &data));
+
+    const PetscScalar* r_array;
+    PetscCall(VecGetArrayRead(r, &r_array));
+    // Convert PETSc Vec to std::vector
+    std::vector<double> r_vec(r_array, r_array + data->L->ndofs);
+    PetscCall(VecRestoreArrayRead(r, &r_array));
+
+    // Apply Hiptmair smoothing
+    std::vector<double> z_vec = hiptmair_smooth(r_vec, *data);
+
+    // Convert std::vector back to PETSc Vec
+    PetscScalar* z_array;
+    PetscCall(VecGetArray(z, &z_array));
+    std::copy(z_vec.begin(), z_vec.end(), z_array);
+    PetscCall(VecRestoreArray(z, &z_array));
+
+    return PETSC_SUCCESS;
+}
+
 
 
 int main(int argc, char* argv[])
@@ -1091,7 +1158,7 @@ int main(int argc, char* argv[])
         for (int degree = 1; degree <= 3; ++degree)
             levels.push_back(build_level(msh, pc, degree));
         
-        // Create discrete gradietn
+        // Create discrete gradienta
 
         std::vector<gradient> gradients;
         for (int degree = 1; degree <= 3; ++degree)
@@ -1268,6 +1335,35 @@ int main(int argc, char* argv[])
 
         PetscCall(PCMGSetLevels(pc_mg, levels.size(), nullptr));
 
+        std::vector<hiptmair_data> hip_data(levels.size());
+
+      //Inverse diagonal for all levels
+
+        for (int l = 1; l < levels.size(); ++l)
+        {
+            const level& L = levels[l];
+            const gradient& Gr = gradients[l];
+
+            // Edge diagonal (diagonal of A) and nodal diagonal (diagonal of G^T A G), computed once
+            std::vector<double> D_e = diagonal_bc(L.bc_mask, coeffs, pc, L.elem_dim, L.folded, L.dofmap, L.ndofs);
+            std::vector<double> D_n = diag_gtAg(Gr, L, coeffs, pc);
+
+            // Invert them: one entry per Nedelec dof, one entry per Lagrange dof
+            hip_data[l].D_e_inv.resize(L.ndofs);
+            for (std::int32_t n = 0; n < L.ndofs; ++n)
+                hip_data[l].D_e_inv[n] = 1.0 / D_e[n];
+
+            hip_data[l].D_n_inv.resize(Gr.ndofs);
+            for (std::int32_t j = 0; j < Gr.ndofs; ++j)
+                hip_data[l].D_n_inv[j] = 1.0 / D_n[j];
+
+            hip_data[l].omega  = 0.8;          // damping factor for both Jacobi steps
+            hip_data[l].L      = &levels[l];
+            hip_data[l].G      = &gradients[l];
+            hip_data[l].coeffs = &coeffs;
+            hip_data[l].pc     = &pc;
+        }
+
         // Data for the AMS coarse solve: assembled A0, assembled G (P1 -> N1E degree 1), coordinates
         ams_data ams;
         PetscCall(build_ams_data(msh, pc, levels[0], ams));
@@ -1292,6 +1388,11 @@ int main(int argc, char* argv[])
                 PetscCall(KSPSetType(smoother, KSPCHEBYSHEV));
                 PetscCall(KSPChebyshevEstEigSet(smoother, PETSC_DETERMINE, PETSC_DETERMINE,
                                                 PETSC_DETERMINE, PETSC_DETERMINE));
+
+                PetscCall(PCSetType(smoother_pc, PCSHELL));
+                PetscCall(PCShellSetContext(smoother_pc, &hip_data[l]));
+                PetscCall(PCShellSetApply(smoother_pc, hiptmair_apply));
+
             }
         }
 
